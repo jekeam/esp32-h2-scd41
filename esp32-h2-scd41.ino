@@ -278,26 +278,26 @@ static uint8_t epdLinkTextColor(int16_t lqi, const char *label) {
 }
 
 static void drawTemperatureIcon(int16_t x, int16_t y) {
-  epdCanvas.fillRoundRect(x + 7, y, 6, 14, 3, EPD_COLOR_YELLOW);
-  epdCanvas.fillCircle(x + 10, y + 16, 5, EPD_COLOR_YELLOW);
-  epdCanvas.drawRoundRect(x + 6, y, 8, 15, 4, EPD_COLOR_BLACK);
-  epdCanvas.drawCircle(x + 10, y + 16, 5, EPD_COLOR_BLACK);
-  epdCanvas.drawFastVLine(x + 10, y + 4, 12, EPD_COLOR_BLACK);
-  epdCanvas.drawFastHLine(x + 14, y + 4, 4, EPD_COLOR_BLACK);
-  epdCanvas.drawFastHLine(x + 14, y + 8, 3, EPD_COLOR_BLACK);
-  epdCanvas.drawFastHLine(x + 14, y + 12, 4, EPD_COLOR_BLACK);
+  epdCanvas.fillRoundRect(x + 8, y, 5, 13, 2, EPD_COLOR_YELLOW);
+  epdCanvas.fillCircle(x + 10, y + 15, 4, EPD_COLOR_YELLOW);
+  epdCanvas.drawRoundRect(x + 7, y, 7, 14, 3, EPD_COLOR_BLACK);
+  epdCanvas.drawCircle(x + 10, y + 15, 4, EPD_COLOR_BLACK);
+  epdCanvas.drawFastVLine(x + 10, y + 4, 11, EPD_COLOR_BLACK);
+  epdCanvas.drawFastHLine(x + 14, y + 4, 3, EPD_COLOR_BLACK);
+  epdCanvas.drawFastHLine(x + 14, y + 8, 2, EPD_COLOR_BLACK);
+  epdCanvas.drawFastHLine(x + 14, y + 12, 3, EPD_COLOR_BLACK);
 }
 
 static void drawHumidityIcon(int16_t x, int16_t y) {
-  epdCanvas.fillTriangle(x + 10, y, x + 3, y + 12, x + 17, y + 12, EPD_COLOR_RED);
-  epdCanvas.fillCircle(x + 10, y + 13, 7, EPD_COLOR_RED);
-  epdCanvas.drawLine(x + 10, y, x + 3, y + 12, EPD_COLOR_BLACK);
-  epdCanvas.drawLine(x + 10, y, x + 17, y + 12, EPD_COLOR_BLACK);
-  epdCanvas.drawLine(x + 3, y + 12, x + 5, y + 18, EPD_COLOR_BLACK);
-  epdCanvas.drawLine(x + 17, y + 12, x + 15, y + 18, EPD_COLOR_BLACK);
-  epdCanvas.drawFastHLine(x + 6, y + 19, 9, EPD_COLOR_BLACK);
-  epdCanvas.drawPixel(x + 5, y + 18, EPD_COLOR_BLACK);
-  epdCanvas.drawPixel(x + 15, y + 18, EPD_COLOR_BLACK);
+  epdCanvas.fillTriangle(x + 10, y, x + 4, y + 11, x + 16, y + 11, EPD_COLOR_RED);
+  epdCanvas.fillCircle(x + 10, y + 12, 6, EPD_COLOR_RED);
+  epdCanvas.drawLine(x + 10, y, x + 4, y + 11, EPD_COLOR_BLACK);
+  epdCanvas.drawLine(x + 10, y, x + 16, y + 11, EPD_COLOR_BLACK);
+  epdCanvas.drawLine(x + 4, y + 11, x + 6, y + 17, EPD_COLOR_BLACK);
+  epdCanvas.drawLine(x + 16, y + 11, x + 14, y + 17, EPD_COLOR_BLACK);
+  epdCanvas.drawFastHLine(x + 7, y + 18, 7, EPD_COLOR_BLACK);
+  epdCanvas.drawPixel(x + 6, y + 17, EPD_COLOR_BLACK);
+  epdCanvas.drawPixel(x + 14, y + 17, EPD_COLOR_BLACK);
 }
 
 static void printTextAt(int16_t x, int16_t y, uint8_t size, const char *text, uint16_t color, bool bold = true) {
@@ -365,23 +365,32 @@ static uint8_t zigbeeSignalBars(int16_t lqi, int8_t rssi) {
 }
 
 static void drawSignalBarsIcon(int16_t right, int16_t y, uint8_t bars, uint16_t color) {
-  const int16_t iconWidth = 28;
+  const int16_t iconWidth = 38;
   const int16_t x = right - iconWidth;
-  const int16_t baseY = y + 13;
+  const int16_t baseY = y + 21;
 
-  epdCanvas.drawFastVLine(x + 2, y + 4, 10, EPD_COLOR_BLACK);
-  epdCanvas.drawLine(x - 1, baseY, x + 5, baseY, EPD_COLOR_BLACK);
-  epdCanvas.drawLine(x + 2, y + 4, x + 6, y, EPD_COLOR_BLACK);
-  epdCanvas.drawLine(x + 2, y + 4, x - 2, y, EPD_COLOR_BLACK);
+  epdCanvas.fillRect(x + 5, y + 7, 4, 14, color);
+  epdCanvas.drawRect(x + 5, y + 7, 4, 14, EPD_COLOR_BLACK);
+  epdCanvas.fillTriangle(x + 1, baseY, x + 13, baseY, x + 7, baseY - 4, color);
+  epdCanvas.drawLine(x + 1, baseY, x + 13, baseY, EPD_COLOR_BLACK);
+  epdCanvas.drawLine(x + 1, baseY, x + 7, baseY - 4, EPD_COLOR_BLACK);
+  epdCanvas.drawLine(x + 13, baseY, x + 7, baseY - 4, EPD_COLOR_BLACK);
+
+  epdCanvas.fillTriangle(x + 7, y + 7, x, y, x + 4, y, color);
+  epdCanvas.fillTriangle(x + 7, y + 7, x + 14, y, x + 10, y, color);
+  epdCanvas.drawLine(x + 7, y + 7, x, y, EPD_COLOR_BLACK);
+  epdCanvas.drawLine(x + 7, y + 7, x + 14, y, EPD_COLOR_BLACK);
+  epdCanvas.drawFastHLine(x, y, 5, EPD_COLOR_BLACK);
+  epdCanvas.drawFastHLine(x + 10, y, 5, EPD_COLOR_BLACK);
 
   for (uint8_t i = 0; i < 3; ++i) {
-    const int16_t barX = x + 10 + (int16_t)i * 6;
-    const int16_t barH = 4 + (int16_t)i * 4;
+    const int16_t barX = x + 16 + (int16_t)i * 8;
+    const int16_t barH = 7 + (int16_t)i * 5;
     const int16_t barY = baseY - barH + 1;
     if (bars > i) {
-      epdCanvas.fillRect(barX, barY, 4, barH, color);
+      epdCanvas.fillRect(barX, barY, 6, barH, color);
     }
-    epdCanvas.drawRect(barX, barY, 4, barH, EPD_COLOR_BLACK);
+    epdCanvas.drawRect(barX, barY, 6, barH, EPD_COLOR_BLACK);
   }
 }
 
@@ -447,11 +456,11 @@ static void renderEpaperFrame(uint16_t co2ppm, float tempC, float rh, const char
 
   snprintf(buf, sizeof(buf), "%.1f C", tempC);
   drawTemperatureIcon(8, 94);
-  printTextAt(36, 99, 2, buf, EPD_COLOR_BLACK);
+  printTextAt(34, 99, 2, buf, EPD_COLOR_BLACK);
 
   snprintf(buf, sizeof(buf), "%.0f %%", rh);
   drawHumidityIcon(8, 116);
-  printTextAt(36, 118, 2, buf, EPD_COLOR_BLACK);
+  printTextAt(34, 118, 2, buf, EPD_COLOR_BLACK);
 
   epdCanvas.fillRect(0, 136, EPD_WIDTH, 16, statusColor);
   epdCanvas.drawFastHLine(0, 136, EPD_WIDTH, EPD_COLOR_BLACK);
