@@ -84,6 +84,8 @@ static bool g_zigbeeReportingConfigured = false;
 static bool g_zclReady = false;
 static bool g_lastZigbeeConnected = false;
 static bool g_forceEpaperUpdate = false;
+static bool g_displayRefreshAnalogSyncing = false;
+static bool g_displayRefreshAnalogSyncPending = false;
 static uint32_t g_connectedAt = 0;
 static uint32_t g_lastZigbeeLqiPoll = 0;
 static int16_t g_zigbeeLqi = -1;
@@ -222,6 +224,7 @@ static void onLedChange(bool state, uint8_t level) {
 }
 
 static void onDisplayRefreshChange(float minutesValue) {
+  const float requestedValue = minutesValue;
   if (!isfinite(minutesValue)) {
     minutesValue = DISPLAY_REFRESH_INTERVAL_DEFAULT_MIN;
   }
@@ -231,9 +234,16 @@ static void onDisplayRefreshChange(float minutesValue) {
   if (rounded > DISPLAY_REFRESH_INTERVAL_MAX) rounded = DISPLAY_REFRESH_INTERVAL_MAX;
 
   display_refresh_interval_minutes = (uint16_t)rounded;
-  g_forceEpaperUpdate = g_hasMeasurement;
-  Serial.printf("[CFG] display refresh interval set to %u min (%lu ms)\n",
+  if (!g_displayRefreshAnalogSyncing) {
+    g_forceEpaperUpdate = g_hasMeasurement;
+    if (!isfinite(requestedValue) || fabsf(requestedValue - (float)rounded) > 0.01f) {
+      g_displayRefreshAnalogSyncPending = true;
+    }
+  }
+
+  Serial.printf("[CFG] display refresh interval set to %u min, requested=%.2f (%lu ms)\n",
                 display_refresh_interval_minutes,
+                requestedValue,
                 (unsigned long)epaperRefreshIntervalMs());
   Serial.flush();
 }
@@ -839,7 +849,10 @@ static void reportZigbeeValues(uint32_t now) {
 }
 
 static void syncDisplayRefreshAnalogOutput(const char *phase, bool report) {
+  g_displayRefreshAnalogSyncing = true;
   const bool setOk = zbDisplayRefresh.setAnalogOutput((float)display_refresh_interval_minutes);
+  g_displayRefreshAnalogSyncing = false;
+
   bool reportOk = true;
   if (report) {
     reportOk = zbDisplayRefresh.reportAnalogOutput();
@@ -851,6 +864,12 @@ static void syncDisplayRefreshAnalogOutput(const char *phase, bool report) {
                 setOk ? "ok" : "FAIL",
                 report ? (reportOk ? "ok" : "FAIL") : "skip");
   Serial.flush();
+}
+
+static void serviceDisplayRefreshAnalogSync() {
+  if (!g_displayRefreshAnalogSyncPending || !zigbeeUsable()) return;
+  g_displayRefreshAnalogSyncPending = false;
+  syncDisplayRefreshAnalogOutput("rounded-int", true);
 }
 
 static void addZigbeeEndpointChecked(const char *label, ZigbeeEP *endpoint) {
@@ -1007,7 +1026,7 @@ void setup() {
   zbDisplayRefresh.setManufacturerAndModel("Custom", "ESP32H2_SCD4x_Display");
   zbDisplayRefresh.addAnalogOutput();
   zbDisplayRefresh.setAnalogOutputApplication(ESP_ZB_ZCL_AO_TIME_OTHER);
-  zbDisplayRefresh.setAnalogOutputDescription("Display refresh min");
+  zbDisplayRefresh.setAnalogOutputDescription("Refresh min");
   zbDisplayRefresh.setAnalogOutputResolution(1.0f);
   zbDisplayRefresh.setAnalogOutputMinMax((float)DISPLAY_REFRESH_INTERVAL_MIN, (float)DISPLAY_REFRESH_INTERVAL_MAX);
   zbDisplayRefresh.onAnalogOutputChange(onDisplayRefreshChange);
@@ -1039,6 +1058,7 @@ void setup() {
 void loop() {
   handleButton();
   updateZigbeeReady();
+  serviceDisplayRefreshAnalogSync();
 
   const uint32_t now = millis();
   updateZigbeeLinkStats(now);
