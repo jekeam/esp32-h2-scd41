@@ -830,8 +830,7 @@ static void updateZigbeeReady() {
   zbLedDim.setLight(g_ledEnabled, g_ledLevel100);
   onLedChange(g_ledEnabled, g_ledLevel100);
   zbLedDim.restoreLight();
-  zbDisplayRefresh.setAnalogOutput((float)display_refresh_interval_minutes);
-  zbDisplayRefresh.reportAnalogOutput();
+  syncDisplayRefreshAnalogOutput("zcl-ready", true);
 
   Serial.println("Zigbee ZCL ready.");
 }
@@ -853,6 +852,30 @@ static void reportZigbeeValues(uint32_t now) {
   zbTempHum.report();
   zbDisplayRefresh.reportAnalogOutput();
   Serial.println("Zigbee report sent.");
+}
+
+static void syncDisplayRefreshAnalogOutput(const char *phase, bool report) {
+  const bool setOk = zbDisplayRefresh.setAnalogOutput((float)display_refresh_interval_minutes);
+  bool reportOk = true;
+  if (report) {
+    reportOk = zbDisplayRefresh.reportAnalogOutput();
+  }
+
+  Serial.printf("[ZB] display refresh AnalogOutput sync: phase=%s, value=%u min, set=%s, report=%s\n",
+                phase,
+                display_refresh_interval_minutes,
+                setOk ? "ok" : "FAIL",
+                report ? (reportOk ? "ok" : "FAIL") : "skip");
+  Serial.flush();
+}
+
+static void addZigbeeEndpointChecked(const char *label, ZigbeeEP *endpoint) {
+  const bool ok = Zigbee.addEndpoint(endpoint);
+  Serial.printf("[ZB] add endpoint: %s, ep=%u, result=%s\n",
+                label,
+                endpoint->getEndpoint(),
+                ok ? "ok" : "FAIL");
+  Serial.flush();
 }
 
 // ---------- SCD4x ----------
@@ -1009,17 +1032,18 @@ void setup() {
   zbAlarm.setBinaryInputApplication(BINARY_INPUT_APPLICATION_TYPE_SECURITY_CARBON_DIOXIDE_DETECTION);
   zbAlarm.setBinaryInputDescription("CO2 alarm");
 
-  Zigbee.addEndpoint(&zbAlarm);
-  Zigbee.addEndpoint(&zbLedDim);
-  Zigbee.addEndpoint(&zbDisplayRefresh);
-  Zigbee.addEndpoint(&zbTempHum);
-  Zigbee.addEndpoint(&zbCO2);
+  addZigbeeEndpointChecked("CO2 alarm BinaryInput", &zbAlarm);
+  addZigbeeEndpointChecked("LED DimmableLight", &zbLedDim);
+  addZigbeeEndpointChecked("Display refresh AnalogOutput", &zbDisplayRefresh);
+  addZigbeeEndpointChecked("Temperature/Humidity", &zbTempHum);
+  addZigbeeEndpointChecked("CO2 measurement", &zbCO2);
 
   Serial.println("Starting Zigbee...");
   Zigbee.setTimeout(5000);
   g_zigbeeStarted = Zigbee.begin();
   if (g_zigbeeStarted) {
     Serial.println("Zigbee stack started. Measurements continue while pairing/connecting.");
+    syncDisplayRefreshAnalogOutput("stack-started", false);
     configureZigbeeReporting();
   } else {
     Serial.println("Zigbee start failed/timeout. Measurements continue locally.");
