@@ -267,6 +267,8 @@ static uint8_t epdLinkTextColor(int16_t lqi, const char *label) {
   return EPD_COLOR_BLACK;
 }
 
+#define USE_PICTOGRAM_STATUS_ICONS 1
+
 static void drawThermoIcon(int16_t x, int16_t y) {
   epdCanvas.fillRect(x + 6, y + 2, 4, 11, EPD_COLOR_RED);
   epdCanvas.fillCircle(x + 8, y + 14, 5, EPD_COLOR_RED);
@@ -304,6 +306,43 @@ static void drawDitheredDropletIcon(int16_t x, int16_t y) {
       epdCanvas.drawPixel(x + col, y + row, color);
     }
   }
+}
+
+static void drawTemperaturePictogramIcon(int16_t x, int16_t y) {
+  epdCanvas.fillCircle(x + 8, y + 8, 8, EPD_COLOR_RED);
+  epdCanvas.drawCircle(x + 8, y + 8, 8, EPD_COLOR_BLACK);
+  epdCanvas.fillRoundRect(x + 7, y + 3, 3, 9, 1, EPD_COLOR_WHITE);
+  epdCanvas.fillCircle(x + 8, y + 12, 3, EPD_COLOR_WHITE);
+  epdCanvas.drawFastVLine(x + 8, y + 4, 8, EPD_COLOR_BLACK);
+  epdCanvas.drawCircle(x + 8, y + 12, 3, EPD_COLOR_BLACK);
+}
+
+static void drawHumidityPictogramIcon(int16_t x, int16_t y) {
+  epdCanvas.fillCircle(x + 8, y + 8, 8, EPD_COLOR_YELLOW);
+  epdCanvas.drawCircle(x + 8, y + 8, 8, EPD_COLOR_BLACK);
+  epdCanvas.fillTriangle(x + 8, y + 3, x + 4, y + 10, x + 12, y + 10, EPD_COLOR_WHITE);
+  epdCanvas.fillCircle(x + 8, y + 10, 4, EPD_COLOR_WHITE);
+  epdCanvas.drawLine(x + 8, y + 3, x + 4, y + 10, EPD_COLOR_BLACK);
+  epdCanvas.drawLine(x + 8, y + 3, x + 12, y + 10, EPD_COLOR_BLACK);
+  epdCanvas.drawLine(x + 4, y + 10, x + 6, y + 14, EPD_COLOR_BLACK);
+  epdCanvas.drawLine(x + 12, y + 10, x + 10, y + 14, EPD_COLOR_BLACK);
+  epdCanvas.drawFastHLine(x + 6, y + 14, 5, EPD_COLOR_BLACK);
+}
+
+static void drawTemperatureStatusIcon(int16_t x, int16_t y) {
+#if USE_PICTOGRAM_STATUS_ICONS
+  drawTemperaturePictogramIcon(x, y);
+#else
+  drawThermoIcon(x, y);
+#endif
+}
+
+static void drawHumidityStatusIcon(int16_t x, int16_t y) {
+#if USE_PICTOGRAM_STATUS_ICONS
+  drawHumidityPictogramIcon(x, y);
+#else
+  drawDitheredDropletIcon(x, y);
+#endif
 }
 
 static void printTextAt(int16_t x, int16_t y, uint8_t size, const char *text, uint16_t color, bool bold = true) {
@@ -452,11 +491,11 @@ static void renderEpaperFrame(uint16_t co2ppm, float tempC, float rh, const char
   epdCanvas.drawFastHLine(8, 90, EPD_WIDTH - 16, EPD_COLOR_BLACK);
 
   snprintf(buf, sizeof(buf), "%.1f C", tempC);
-  drawThermoIcon(10, 98);
+  drawTemperatureStatusIcon(10, 98);
   printTextAt(30, 99, 2, buf, EPD_COLOR_BLACK);
 
   snprintf(buf, sizeof(buf), "%.0f %%", rh);
-  drawDitheredDropletIcon(12, 118);
+  drawHumidityStatusIcon(10, 118);
   printTextAt(30, 118, 2, buf, EPD_COLOR_BLACK);
 
   epdCanvas.fillRect(0, 136, EPD_WIDTH, 16, statusColor);
