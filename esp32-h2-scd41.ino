@@ -1003,7 +1003,6 @@ void setup() {
   zbDisplayRefresh.setAnalogOutputDescription("Display refresh min");
   zbDisplayRefresh.setAnalogOutputResolution(1.0f);
   zbDisplayRefresh.setAnalogOutputMinMax((float)DISPLAY_REFRESH_INTERVAL_MIN, (float)DISPLAY_REFRESH_INTERVAL_MAX);
-  zbDisplayRefresh.setAnalogOutput((float)display_refresh_interval_minutes);
   zbDisplayRefresh.onAnalogOutputChange(onDisplayRefreshChange);
 
   zbAlarm.addBinaryInput();
