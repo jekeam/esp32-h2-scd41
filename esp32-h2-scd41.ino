@@ -365,32 +365,18 @@ static uint8_t zigbeeSignalBars(int16_t lqi, int8_t rssi) {
 }
 
 static void drawSignalBarsIcon(int16_t right, int16_t y, uint8_t bars, uint16_t color) {
-  const int16_t iconWidth = 38;
+  const int16_t iconWidth = 29;
   const int16_t x = right - iconWidth;
-  const int16_t baseY = y + 21;
-
-  epdCanvas.fillRect(x + 5, y + 7, 4, 14, color);
-  epdCanvas.drawRect(x + 5, y + 7, 4, 14, EPD_COLOR_BLACK);
-  epdCanvas.fillTriangle(x + 1, baseY, x + 13, baseY, x + 7, baseY - 4, color);
-  epdCanvas.drawLine(x + 1, baseY, x + 13, baseY, EPD_COLOR_BLACK);
-  epdCanvas.drawLine(x + 1, baseY, x + 7, baseY - 4, EPD_COLOR_BLACK);
-  epdCanvas.drawLine(x + 13, baseY, x + 7, baseY - 4, EPD_COLOR_BLACK);
-
-  epdCanvas.fillTriangle(x + 7, y + 7, x, y, x + 4, y, color);
-  epdCanvas.fillTriangle(x + 7, y + 7, x + 14, y, x + 10, y, color);
-  epdCanvas.drawLine(x + 7, y + 7, x, y, EPD_COLOR_BLACK);
-  epdCanvas.drawLine(x + 7, y + 7, x + 14, y, EPD_COLOR_BLACK);
-  epdCanvas.drawFastHLine(x, y, 5, EPD_COLOR_BLACK);
-  epdCanvas.drawFastHLine(x + 10, y, 5, EPD_COLOR_BLACK);
+  const int16_t baseY = y + 23;
 
   for (uint8_t i = 0; i < 3; ++i) {
-    const int16_t barX = x + 16 + (int16_t)i * 8;
-    const int16_t barH = 7 + (int16_t)i * 5;
+    const int16_t barX = x + (int16_t)i * 10;
+    const int16_t barH = 8 + (int16_t)i * 6;
     const int16_t barY = baseY - barH + 1;
     if (bars > i) {
-      epdCanvas.fillRect(barX, barY, 6, barH, color);
+      epdCanvas.fillRect(barX, barY, 7, barH, color);
     }
-    epdCanvas.drawRect(barX, barY, 6, barH, EPD_COLOR_BLACK);
+    epdCanvas.drawRect(barX, barY, 7, barH, EPD_COLOR_BLACK);
   }
 }
 
