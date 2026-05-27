@@ -1,0 +1,1068 @@
+#ifndef ZIGBEE_MODE_ED
+#error "Zigbee End Device mode is not selected (Tools -> Zigbee mode -> End Device)."
+#endif
+
+#include <Wire.h>
+#include <Zigbee.h>
+#include <nwk/esp_zigbee_nwk.h>
+#include <math.h>
+#include <string.h>
+
+#include <freertos/FreeRTOS.h>
+#include <freertos/task.h>
+
+#include <Adafruit_GFX.h>
+#include <Adafruit_NeoPixel.h>
+#include <SensirionCore.h>
+#include <SensirionI2cScd4x.h>
+
+#include "Display_EPD_W21.h"
+#include "Display_EPD_W21_spi.h"
+
+// ---------- Pins ----------
+#define I2C_SDA 10  // ESP32-H2 Super Mini
+#define I2C_SCL 11  // ESP32-H2 Super Mini
+
+#define WS2812_GPIO 8
+#define WS2812_LEDS 1
+
+// DESPI-C02 wiring is defined in Display_EPD_W21_spi.h:
+// BUSY=GPIO0, RES=GPIO1, D/C=GPIO2, CS=GPIO3, SCK=GPIO4, SDI/MOSI=GPIO5.
+
+// ---------- SCD4x ----------
+static constexpr uint8_t SCD4X_I2C_ADDR = 0x62;
+
+// ---------- Zigbee endpoints ----------
+#define EP_TEMP_HUM 10
+#define EP_CO2 11
+#define EP_LED_DIM 12
+#define EP_ALARM 13
+#define EP_DISPLAY_REFRESH 14
+
+// ---------- Timing ----------
+static constexpr uint32_t SENSOR_POLL_MS = 1000;
+static constexpr uint32_t ZB_REPORT_MS = 30000;
+static constexpr uint16_t DISPLAY_REFRESH_INTERVAL_MIN = 1;
+static constexpr uint16_t DISPLAY_REFRESH_INTERVAL_MAX = 60;
+static constexpr uint16_t DISPLAY_REFRESH_INTERVAL_DEFAULT_MIN = 1;
+static uint16_t display_refresh_interval_minutes = DISPLAY_REFRESH_INTERVAL_DEFAULT_MIN;
+static constexpr uint32_t EPAPER_SKIP_LOG_MS = 30000;
+static constexpr uint32_t ZIGBEE_LQI_POLL_MS = 10000;
+static constexpr uint32_t ZIGBEE_READY_DELAY_MS = 2000;
+static constexpr uint16_t EPAPER_CO2_DELTA_PPM = 50;
+static constexpr float EPAPER_TEMP_DELTA_C = 0.5f;
+static constexpr float EPAPER_RH_DELTA = 2.0f;
+
+static uint32_t epaperRefreshIntervalMs() {
+  const uint16_t minutes = display_refresh_interval_minutes
+                             ? display_refresh_interval_minutes
+                             : DISPLAY_REFRESH_INTERVAL_DEFAULT_MIN;
+  return (uint32_t)minutes * 60UL * 1000UL;
+}
+
+// ---------- PPM limits ----------
+static uint16_t green_ppm = 800;
+static uint16_t yellow_ppm = 1200;
+static uint16_t orange_ppm = 1800;
+static uint16_t red_ppm = 4999;
+
+// ---------- Objects ----------
+Adafruit_NeoPixel pixels(WS2812_LEDS, WS2812_GPIO, NEO_GRB + NEO_KHZ800);
+SensirionI2cScd4x scd4x;
+
+ZigbeeTempSensor zbTempHum(EP_TEMP_HUM);
+ZigbeeCarbonDioxideSensor zbCO2(EP_CO2);
+ZigbeeDimmableLight zbLedDim(EP_LED_DIM);
+ZigbeeBinary zbAlarm(EP_ALARM);
+ZigbeeAnalog zbDisplayRefresh(EP_DISPLAY_REFRESH);
+
+// ---------- State ----------
+static const uint8_t button = BOOT_PIN;
+
+static bool g_zigbeeStarted = false;
+static bool g_zigbeeReportingConfigured = false;
+static bool g_zclReady = false;
+static bool g_lastZigbeeConnected = false;
+static bool g_forceEpaperUpdate = false;
+static uint32_t g_connectedAt = 0;
+static uint32_t g_lastZigbeeLqiPoll = 0;
+static int16_t g_zigbeeLqi = -1;
+static int8_t g_zigbeeRssi = 0;
+static uint8_t g_zigbeeChannel = 0;
+static uint16_t g_zigbeeShortAddr = 0xFFFF;
+static uint16_t g_zigbeeParentShortAddr = 0xFFFF;
+
+static bool g_ledEnabled = true;
+static uint8_t g_ledLevel100 = 100;
+static bool g_alarm = false;
+
+static uint16_t g_lastCO2 = 0;
+static float g_lastTempC = NAN;
+static float g_lastRh = NAN;
+static bool g_hasMeasurement = false;
+
+static uint32_t lastPoll = 0;
+static uint32_t lastReport = 0;
+static uint32_t lastEpaper = 0;
+static uint32_t lastEpaperSkipLog = 0;
+static uint16_t lastEpaperCO2 = 0;
+static float lastEpaperTempC = NAN;
+static float lastEpaperRh = NAN;
+static uint8_t lastEpaperBand = 255;
+static bool hasEpaperMeasurement = false;
+static uint32_t g_epaperFrameSeq = 0;
+
+static uint8_t epdFrame[EPD_FRAME_BYTES];
+
+static portMUX_TYPE g_epaperMux = portMUX_INITIALIZER_UNLOCKED;
+static TaskHandle_t g_epaperTaskHandle = nullptr;
+static volatile bool g_epaperJobPending = false;
+static volatile bool g_epaperRefreshBusy = false;
+static uint16_t g_epaperJobCO2 = 0;
+static float g_epaperJobTempC = NAN;
+static float g_epaperJobRh = NAN;
+static bool g_epaperJobForce = false;
+static bool g_epaperJobFirstDraw = false;
+static bool g_epaperJobPeriodic = false;
+static uint8_t g_epaperJobPrevBand = 255;
+static uint8_t g_epaperJobBand = 255;
+static int16_t g_epaperJobLqi = -1;
+static int8_t g_epaperJobRssi = 0;
+static char g_epaperJobZbLabel[12] = "NO ZB";
+
+class EpdCanvas : public Adafruit_GFX {
+public:
+  EpdCanvas() : Adafruit_GFX(EPD_WIDTH, EPD_HEIGHT) {}
+
+  void drawPixel(int16_t x, int16_t y, uint16_t color) override {
+    if (x < 0 || y < 0 || x >= EPD_WIDTH || y >= EPD_HEIGHT) return;
+    const uint16_t index = (uint16_t)y * EPD_WIDTH + (uint16_t)x;
+    const uint16_t byteIndex = index >> 2;
+    const uint8_t shift = (3 - (index & 0x03)) * 2;
+    epdFrame[byteIndex] = (epdFrame[byteIndex] & ~(0x03 << shift)) | ((color & 0x03) << shift);
+  }
+
+  void clear(uint8_t color) {
+    const uint8_t packed = (color & 0x03) * 0x55;
+    memset(epdFrame, packed, sizeof(epdFrame));
+  }
+};
+
+static EpdCanvas epdCanvas;
+
+// ---------- LED ----------
+static void setLedRGB(uint8_t r, uint8_t g, uint8_t b) {
+  pixels.setPixelColor(0, pixels.Color(r, g, b));
+  pixels.show();
+}
+
+static void updateLedByCO2(uint16_t ppm) {
+  if (!g_ledEnabled) {
+    pixels.clear();
+    pixels.show();
+    return;
+  }
+
+  uint8_t maxBr = (uint8_t)((uint16_t)g_ledLevel100 * 255 / 100);
+
+  const float CO2_MIN = 400.0f;
+  const float CO2_MAX = (float)red_ppm;
+
+  float x;
+  if (ppm <= CO2_MIN) {
+    x = 0.0f;
+  } else if (ppm >= CO2_MAX) {
+    x = 1.0f;
+  } else {
+    x = (float)(ppm - CO2_MIN) / (CO2_MAX - CO2_MIN);
+  }
+
+  const float gamma = 3.0f;
+  float k = powf(x, gamma);
+  const float k_min = 0.08f;
+  k = k_min + (1.0f - k_min) * k;
+
+  uint8_t br = (uint8_t)(maxBr * k);
+  pixels.setBrightness(br);
+
+  if (ppm >= red_ppm) {
+    bool on = ((millis() / 500) % 2) == 0;
+    pixels.setPixelColor(0, on ? pixels.Color(160, 0, 0) : pixels.Color(0, 0, 0));
+    pixels.show();
+    return;
+  }
+
+  uint8_t r = 0, g = 0, b = 0;
+  if (ppm < green_ppm) {
+    r = 0;   g = 120; b = 0;
+  } else if (ppm < yellow_ppm) {
+    r = 120; g = 120; b = 0;
+  } else if (ppm < orange_ppm) {
+    r = 160; g = 60;  b = 0;
+  } else {
+    r = 160; g = 0;   b = 0;
+  }
+
+  pixels.setPixelColor(0, pixels.Color(r, g, b));
+  pixels.show();
+}
+
+static void onLedChange(bool state, uint8_t level) {
+  g_ledEnabled = state;
+  if (level > 100) level = 100;
+  g_ledLevel100 = level;
+
+  uint8_t b = (uint8_t)((uint16_t)g_ledLevel100 * 255 / 100);
+  pixels.setBrightness(b);
+
+  if (!g_ledEnabled) {
+    pixels.clear();
+    pixels.show();
+  }
+}
+
+static void onDisplayRefreshChange(float minutesValue) {
+  if (!isfinite(minutesValue)) {
+    minutesValue = DISPLAY_REFRESH_INTERVAL_DEFAULT_MIN;
+  }
+
+  int32_t rounded = (int32_t)roundf(minutesValue);
+  if (rounded < DISPLAY_REFRESH_INTERVAL_MIN) rounded = DISPLAY_REFRESH_INTERVAL_MIN;
+  if (rounded > DISPLAY_REFRESH_INTERVAL_MAX) rounded = DISPLAY_REFRESH_INTERVAL_MAX;
+
+  display_refresh_interval_minutes = (uint16_t)rounded;
+  g_forceEpaperUpdate = g_hasMeasurement;
+  Serial.printf("[CFG] display refresh interval set to %u min (%lu ms)\n",
+                display_refresh_interval_minutes,
+                (unsigned long)epaperRefreshIntervalMs());
+  Serial.flush();
+}
+
+// ---------- E-paper ----------
+static uint8_t epdStatusColor(uint16_t ppm) {
+  if (ppm >= orange_ppm) return EPD_COLOR_RED;
+  if (ppm >= yellow_ppm) return EPD_COLOR_YELLOW;
+  return EPD_COLOR_WHITE;
+}
+
+static uint8_t airQualityBand(uint16_t ppm) {
+  if (ppm < green_ppm) return 0;
+  if (ppm < yellow_ppm) return 1;
+  if (ppm < orange_ppm) return 2;
+  if (ppm < red_ppm) return 3;
+  return 4;
+}
+
+static uint8_t epdPpmTextColor(uint16_t ppm) {
+  if (ppm >= orange_ppm) return EPD_COLOR_RED;
+  if (ppm >= green_ppm) return EPD_COLOR_YELLOW;
+  return EPD_COLOR_BLACK;
+}
+
+static uint8_t epdLinkTextColor(int16_t lqi, const char *label) {
+  if (strncmp(label, "NO ZB", 5) == 0) return EPD_COLOR_RED;
+  if (lqi < 0) return EPD_COLOR_YELLOW;
+  if (lqi < 80) return EPD_COLOR_RED;
+  if (lqi < 170) return EPD_COLOR_YELLOW;
+  return EPD_COLOR_BLACK;
+}
+
+static void drawThermoIcon(int16_t x, int16_t y) {
+  epdCanvas.fillRect(x + 6, y + 2, 4, 11, EPD_COLOR_RED);
+  epdCanvas.fillCircle(x + 8, y + 14, 5, EPD_COLOR_RED);
+  epdCanvas.drawRect(x + 5, y + 1, 6, 12, EPD_COLOR_BLACK);
+  epdCanvas.drawCircle(x + 8, y + 14, 5, EPD_COLOR_BLACK);
+}
+
+static void drawDitheredDropletIcon(int16_t x, int16_t y) {
+  static const char *drop[] = {
+    "......#......",
+    ".....###.....",
+    "....#####....",
+    "...#######...",
+    "..#########..",
+    "..#########..",
+    ".###########.",
+    ".###########.",
+    ".###########.",
+    "..#########..",
+    "..#########..",
+    "...#######...",
+    "....#####....",
+    ".....###.....",
+  };
+
+  for (uint8_t row = 0; row < 14; ++row) {
+    for (uint8_t col = 0; col < 13; ++col) {
+      if (drop[row][col] != '#') continue;
+      const bool edge = row == 0 || row == 13 || col == 0 || col == 12
+                        || drop[row - (row > 0 ? 1 : 0)][col] != '#'
+                        || drop[row + (row < 13 ? 1 : 0)][col] != '#'
+                        || drop[row][col - (col > 0 ? 1 : 0)] != '#'
+                        || drop[row][col + (col < 12 ? 1 : 0)] != '#';
+      const uint8_t color = edge || (((row + col) & 0x01) == 0) ? EPD_COLOR_BLACK : EPD_COLOR_WHITE;
+      epdCanvas.drawPixel(x + col, y + row, color);
+    }
+  }
+}
+
+static void printTextAt(int16_t x, int16_t y, uint8_t size, const char *text, uint16_t color, bool bold = true) {
+  epdCanvas.setTextSize(size);
+  epdCanvas.setTextColor(color);
+  epdCanvas.setCursor(x, y);
+  epdCanvas.print(text);
+  if (bold) {
+    epdCanvas.setCursor(x + 1, y);
+    epdCanvas.print(text);
+  }
+}
+
+static void printRightAligned(int16_t right, int16_t y, uint8_t size, const char *text, uint16_t color, bool bold = true) {
+  int16_t x1, y1;
+  uint16_t w, h;
+  epdCanvas.setTextSize(size);
+  epdCanvas.setTextColor(color);
+  epdCanvas.getTextBounds(text, 0, y, &x1, &y1, &w, &h);
+  const int16_t x = right - (int16_t)w - (bold ? 1 : 0);
+  printTextAt(x, y, size, text, color, bold);
+}
+
+static void printEmphasisRightAligned(int16_t right, int16_t y, uint8_t size, const char *text, uint16_t color) {
+  int16_t x1, y1;
+  uint16_t w, h;
+  epdCanvas.setTextSize(size);
+  epdCanvas.setTextColor(color);
+  epdCanvas.getTextBounds(text, 0, y, &x1, &y1, &w, &h);
+  const int16_t x = right - (int16_t)w - 1;
+  epdCanvas.setCursor(x, y);
+  epdCanvas.print(text);
+  epdCanvas.setCursor(x + 1, y);
+  epdCanvas.print(text);
+  epdCanvas.setCursor(x, y + 1);
+  epdCanvas.print(text);
+}
+
+static uint8_t zigbeeSignalBars(int16_t lqi, int8_t rssi) {
+  if (lqi < 0) return 0;
+
+  uint8_t lqiBars = 0;
+  if (lqi >= 170) {
+    lqiBars = 3;
+  } else if (lqi >= 110) {
+    lqiBars = 2;
+  } else if (lqi >= 70) {
+    lqiBars = 1;
+  }
+
+  uint8_t rssiBars = lqiBars;
+  if (rssi < 0) {
+    if (rssi > -65) {
+      rssiBars = 3;
+    } else if (rssi > -75) {
+      rssiBars = 2;
+    } else if (rssi > -85) {
+      rssiBars = 1;
+    } else {
+      rssiBars = 0;
+    }
+  }
+
+  return (lqiBars < rssiBars) ? lqiBars : rssiBars;
+}
+
+static void drawSignalBarsIcon(int16_t right, int16_t y, uint8_t bars, uint16_t color) {
+  const int16_t iconWidth = 28;
+  const int16_t x = right - iconWidth;
+  const int16_t baseY = y + 13;
+
+  epdCanvas.drawFastVLine(x + 2, y + 4, 10, EPD_COLOR_BLACK);
+  epdCanvas.drawLine(x - 1, baseY, x + 5, baseY, EPD_COLOR_BLACK);
+  epdCanvas.drawLine(x + 2, y + 4, x + 6, y, EPD_COLOR_BLACK);
+  epdCanvas.drawLine(x + 2, y + 4, x - 2, y, EPD_COLOR_BLACK);
+
+  for (uint8_t i = 0; i < 3; ++i) {
+    const int16_t barX = x + 10 + (int16_t)i * 6;
+    const int16_t barH = 4 + (int16_t)i * 4;
+    const int16_t barY = baseY - barH + 1;
+    if (bars > i) {
+      epdCanvas.fillRect(barX, barY, 4, barH, color);
+    }
+    epdCanvas.drawRect(barX, barY, 4, barH, EPD_COLOR_BLACK);
+  }
+}
+
+static void drawRefreshMarker(int16_t x, int16_t y, uint32_t frameSeq, uint8_t color) {
+  char marker[8];
+  snprintf(marker, sizeof(marker), "R%02lu", (unsigned long)(frameSeq % 100));
+
+  printTextAt(x, y, 2, marker, EPD_COLOR_BLACK);
+
+  const uint8_t dotCount = 6;
+  const uint8_t active = frameSeq % dotCount;
+  for (uint8_t i = 0; i < dotCount; ++i) {
+    const int16_t dotX = x + 4 + (int16_t)i * 10;
+    const uint8_t dotColor = (i == active) ? color : EPD_COLOR_BLACK;
+    if (i == active) {
+      epdCanvas.fillCircle(dotX, y - 7, 3, dotColor);
+      epdCanvas.drawCircle(dotX, y - 7, 3, EPD_COLOR_BLACK);
+    } else {
+      epdCanvas.drawCircle(dotX, y - 7, 2, dotColor);
+    }
+  }
+}
+
+static void drawZigbeeStats(int16_t lqi, int8_t rssi, uint8_t color) {
+  drawSignalBarsIcon(EPD_WIDTH - 4, 2, zigbeeSignalBars(lqi, rssi), color);
+}
+
+static void formatZigbeeLabel(char *out, size_t len) {
+  if (!Zigbee.connected()) {
+    snprintf(out, len, "NO ZB");
+  } else if (!g_zclReady) {
+    snprintf(out, len, "ZB...");
+  } else if (g_zigbeeLqi >= 0) {
+    snprintf(out, len, "L%d %d", g_zigbeeLqi, g_zigbeeRssi);
+  } else {
+    snprintf(out, len, "L-- --");
+  }
+}
+
+static void renderEpaperFrame(uint16_t co2ppm, float tempC, float rh, const char *zigbeeLabel, int16_t lqi, int8_t rssi, uint32_t frameSeq) {
+  char buf[24];
+  const uint8_t statusColor = epdStatusColor(co2ppm);
+  const uint16_t statusText = (statusColor == EPD_COLOR_RED) ? EPD_COLOR_WHITE : EPD_COLOR_BLACK;
+  const uint8_t ppmTextColor = epdPpmTextColor(co2ppm);
+  const uint8_t linkTextColor = epdLinkTextColor(lqi, zigbeeLabel);
+
+  epdCanvas.clear(EPD_COLOR_WHITE);
+  epdCanvas.fillRect(0, 0, EPD_WIDTH, 34, EPD_COLOR_WHITE);
+  epdCanvas.drawRect(0, 0, EPD_WIDTH, EPD_HEIGHT, EPD_COLOR_BLACK);
+  epdCanvas.drawFastHLine(0, 34, EPD_WIDTH, EPD_COLOR_BLACK);
+
+  epdCanvas.setTextWrap(false);
+  drawRefreshMarker(5, 18, frameSeq, ppmTextColor);
+
+  drawZigbeeStats(lqi, rssi, linkTextColor);
+
+  snprintf(buf, sizeof(buf), "%u", co2ppm);
+  printTextAt(10, 46, (co2ppm > 9999) ? 3 : 4, buf, ppmTextColor);
+
+  printTextAt(110, 66, 2, "ppm", ppmTextColor);
+
+  epdCanvas.drawFastHLine(8, 90, EPD_WIDTH - 16, EPD_COLOR_BLACK);
+
+  snprintf(buf, sizeof(buf), "%.1f C", tempC);
+  drawThermoIcon(10, 98);
+  printTextAt(30, 99, 2, buf, EPD_COLOR_BLACK);
+
+  snprintf(buf, sizeof(buf), "%.0f %%", rh);
+  drawDitheredDropletIcon(12, 118);
+  printTextAt(30, 118, 2, buf, EPD_COLOR_BLACK);
+
+  epdCanvas.fillRect(0, 136, EPD_WIDTH, 16, statusColor);
+  epdCanvas.drawFastHLine(0, 136, EPD_WIDTH, EPD_COLOR_BLACK);
+  const char *statusLabel = "AIR GOOD";
+  if (co2ppm < green_ppm) {
+    statusLabel = "AIR GOOD";
+  } else if (co2ppm < yellow_ppm) {
+    statusLabel = "AIR OK";
+  } else if (co2ppm < orange_ppm) {
+    statusLabel = "VENTILATE";
+  } else if (co2ppm < red_ppm) {
+    statusLabel = "HIGH CO2";
+  } else {
+    statusLabel = "ALARM";
+  }
+  printTextAt(8, 141, 1, statusLabel, statusText);
+}
+
+static bool epaperBusyOrPending() {
+  portENTER_CRITICAL(&g_epaperMux);
+  const bool busy = g_epaperRefreshBusy || g_epaperJobPending;
+  portEXIT_CRITICAL(&g_epaperMux);
+  return busy;
+}
+
+static bool queueEpaperRefresh(uint16_t co2ppm, float tempC, float rh, bool force, bool firstDraw, bool periodicReady,
+                               uint8_t previousBand, uint8_t currentBand, const char *zigbeeLabel) {
+  portENTER_CRITICAL(&g_epaperMux);
+  if (g_epaperRefreshBusy || g_epaperJobPending) {
+    portEXIT_CRITICAL(&g_epaperMux);
+    return false;
+  }
+
+  g_epaperJobCO2 = co2ppm;
+  g_epaperJobTempC = tempC;
+  g_epaperJobRh = rh;
+  g_epaperJobForce = force;
+  g_epaperJobFirstDraw = firstDraw;
+  g_epaperJobPeriodic = periodicReady;
+  g_epaperJobPrevBand = previousBand;
+  g_epaperJobBand = currentBand;
+  g_epaperJobLqi = g_zigbeeLqi;
+  g_epaperJobRssi = g_zigbeeRssi;
+  snprintf(g_epaperJobZbLabel, sizeof(g_epaperJobZbLabel), "%s", zigbeeLabel);
+  g_epaperJobPending = true;
+  portEXIT_CRITICAL(&g_epaperMux);
+
+  if (g_epaperTaskHandle) {
+    xTaskNotifyGive(g_epaperTaskHandle);
+  }
+  return true;
+}
+
+static bool takeEpaperRefreshJob(uint16_t &co2ppm, float &tempC, float &rh, bool &force, bool &firstDraw, bool &periodicReady,
+                                 uint8_t &previousBand, uint8_t &currentBand, int16_t &lqi, int8_t &rssi,
+                                 char *zigbeeLabel, size_t zigbeeLabelLen) {
+  portENTER_CRITICAL(&g_epaperMux);
+  if (!g_epaperJobPending) {
+    portEXIT_CRITICAL(&g_epaperMux);
+    return false;
+  }
+
+  co2ppm = g_epaperJobCO2;
+  tempC = g_epaperJobTempC;
+  rh = g_epaperJobRh;
+  force = g_epaperJobForce;
+  firstDraw = g_epaperJobFirstDraw;
+  periodicReady = g_epaperJobPeriodic;
+  previousBand = g_epaperJobPrevBand;
+  currentBand = g_epaperJobBand;
+  lqi = g_epaperJobLqi;
+  rssi = g_epaperJobRssi;
+  snprintf(zigbeeLabel, zigbeeLabelLen, "%s", g_epaperJobZbLabel);
+  g_epaperJobPending = false;
+  g_epaperRefreshBusy = true;
+  portEXIT_CRITICAL(&g_epaperMux);
+  return true;
+}
+
+static void finishEpaperRefreshJob() {
+  portENTER_CRITICAL(&g_epaperMux);
+  g_epaperRefreshBusy = false;
+  portEXIT_CRITICAL(&g_epaperMux);
+}
+
+static void runEpaperRefresh(uint16_t co2ppm, float tempC, float rh, bool force, bool firstDraw, bool periodicReady,
+                             uint8_t previousBand, uint8_t currentBand, int16_t lqi, int8_t rssi, const char *zigbeeLabel) {
+  const uint32_t refreshStart = millis();
+  Serial.printf("[EPD] cycle start: co2=%u ppm, temp=%.2f C, rh=%.2f %%, force=%u, firstDraw=%u, periodicReady=%u, band=%u->%u, lqi=%d, rssi=%d, label=%s\n",
+                co2ppm, tempC, rh, force ? 1 : 0, firstDraw ? 1 : 0, periodicReady ? 1 : 0, previousBand, currentBand, lqi, rssi, zigbeeLabel);
+  Serial.println("[EPD] note: full 4-color refresh is slow, but it runs in its own task so sensor/Zigbee loop keeps working.");
+  Serial.flush();
+
+  const uint32_t renderStart = millis();
+  const uint32_t frameSeq = ++g_epaperFrameSeq;
+  renderEpaperFrame(co2ppm, tempC, rh, zigbeeLabel, lqi, rssi, frameSeq);
+  Serial.printf("[EPD] render frame done, frame=%lu, elapsed=%lu ms\n",
+                (unsigned long)frameSeq,
+                (unsigned long)(millis() - renderStart));
+  Serial.flush();
+
+  EPD_init();
+  EPD_displayNative(epdFrame);
+  EPD_sleep();
+
+  lastEpaper = millis();
+  lastEpaperCO2 = co2ppm;
+  lastEpaperTempC = tempC;
+  lastEpaperRh = rh;
+  lastEpaperBand = currentBand;
+  hasEpaperMeasurement = true;
+
+  Serial.printf("[EPD] cycle done, total=%lu ms\n", (unsigned long)(millis() - refreshStart));
+  Serial.flush();
+}
+
+static void epaperTask(void *parameter) {
+  (void)parameter;
+
+  for (;;) {
+    ulTaskNotifyTake(pdTRUE, pdMS_TO_TICKS(250));
+
+    uint16_t co2ppm = 0;
+    float tempC = NAN;
+    float rh = NAN;
+    bool force = false;
+    bool firstDraw = false;
+    bool periodicReady = false;
+    uint8_t previousBand = 255;
+    uint8_t currentBand = 255;
+    int16_t lqi = -1;
+    int8_t rssi = 0;
+    char zigbeeLabel[12] = "NO ZB";
+
+    if (!takeEpaperRefreshJob(co2ppm, tempC, rh, force, firstDraw, periodicReady, previousBand, currentBand, lqi, rssi,
+                              zigbeeLabel, sizeof(zigbeeLabel))) {
+      continue;
+    }
+
+    runEpaperRefresh(co2ppm, tempC, rh, force, firstDraw, periodicReady, previousBand, currentBand, lqi, rssi, zigbeeLabel);
+    finishEpaperRefreshJob();
+  }
+}
+
+static void updateEpaper(uint16_t co2ppm, float tempC, float rh, bool force = false) {
+  const uint32_t now = millis();
+  const uint32_t age = lastEpaper ? now - lastEpaper : 0;
+  const uint32_t refreshIntervalMs = epaperRefreshIntervalMs();
+  const uint8_t currentBand = airQualityBand(co2ppm);
+  const bool firstDraw = !hasEpaperMeasurement;
+  const bool changeReady = !lastEpaper || (age >= refreshIntervalMs);
+  const bool periodicReady = lastEpaper && (age >= refreshIntervalMs);
+  const bool bandChanged = hasEpaperMeasurement && currentBand != lastEpaperBand;
+  const bool valueChanged = !hasEpaperMeasurement
+                            || abs((int32_t)co2ppm - (int32_t)lastEpaperCO2) >= EPAPER_CO2_DELTA_PPM
+                            || fabsf(tempC - lastEpaperTempC) >= EPAPER_TEMP_DELTA_C
+                            || fabsf(rh - lastEpaperRh) >= EPAPER_RH_DELTA;
+
+  const bool shouldRefresh = force || firstDraw || periodicReady || ((bandChanged || valueChanged) && changeReady);
+
+  if (!shouldRefresh) {
+    if (!lastEpaperSkipLog || now - lastEpaperSkipLog >= EPAPER_SKIP_LOG_MS) {
+      lastEpaperSkipLog = now;
+      Serial.printf("[EPD] skip refresh: auto_policy=change/manual/periodic, force=%u, firstDraw=%u, changeReady=%u, periodicReady=%u, busy=%u, age=%lu ms, refresh_interval=%lu ms, bandChanged=%u, valueChanged=%u, band=%u->%u, dCO2=%ld, dT=%.2f, dRH=%.2f\n",
+                    force ? 1 : 0,
+                    firstDraw ? 1 : 0,
+                    changeReady ? 1 : 0,
+                    periodicReady ? 1 : 0,
+                    epaperBusyOrPending() ? 1 : 0,
+                    (unsigned long)age,
+                    (unsigned long)refreshIntervalMs,
+                    bandChanged ? 1 : 0,
+                    valueChanged ? 1 : 0,
+                    lastEpaperBand,
+                    currentBand,
+                    hasEpaperMeasurement ? (long)((int32_t)co2ppm - (int32_t)lastEpaperCO2) : 0,
+                    hasEpaperMeasurement ? (tempC - lastEpaperTempC) : 0.0f,
+                    hasEpaperMeasurement ? (rh - lastEpaperRh) : 0.0f);
+      Serial.flush();
+    }
+    return;
+  }
+
+  char zbLabel[12];
+  formatZigbeeLabel(zbLabel, sizeof(zbLabel));
+
+  if (!g_epaperTaskHandle) {
+    Serial.println("[EPD] task is not running; falling back to blocking refresh.");
+    Serial.flush();
+    runEpaperRefresh(co2ppm, tempC, rh, force, firstDraw, periodicReady, lastEpaperBand, currentBand, g_zigbeeLqi, g_zigbeeRssi, zbLabel);
+    return;
+  }
+
+  if (!queueEpaperRefresh(co2ppm, tempC, rh, force, firstDraw, periodicReady, lastEpaperBand, currentBand, zbLabel)) {
+    if (!lastEpaperSkipLog || now - lastEpaperSkipLog >= EPAPER_SKIP_LOG_MS) {
+      lastEpaperSkipLog = now;
+      Serial.printf("[EPD] refresh request skipped: previous full refresh still running, age=%lu ms, co2=%u, label=%s\n",
+                    (unsigned long)age, co2ppm, zbLabel);
+      Serial.flush();
+    }
+    return;
+  }
+
+  Serial.printf("[EPD] refresh queued: co2=%u ppm, temp=%.2f C, rh=%.2f %%, force=%u, firstDraw=%u, changeReady=%u, periodicReady=%u, refresh_interval=%lu ms, bandChanged=%u, valueChanged=%u, label=%s\n",
+                co2ppm, tempC, rh, force ? 1 : 0, firstDraw ? 1 : 0, changeReady ? 1 : 0, periodicReady ? 1 : 0,
+                (unsigned long)refreshIntervalMs, bandChanged ? 1 : 0, valueChanged ? 1 : 0, zbLabel);
+  Serial.flush();
+}
+
+// ---------- Zigbee ----------
+static bool zigbeeUsable() {
+  return g_zigbeeStarted && g_zclReady && Zigbee.connected();
+}
+
+static void resetZigbeeLinkStats() {
+  g_zigbeeLqi = -1;
+  g_zigbeeRssi = 0;
+  g_zigbeeChannel = 0;
+  g_zigbeeShortAddr = 0xFFFF;
+  g_zigbeeParentShortAddr = 0xFFFF;
+  g_lastZigbeeLqiPoll = 0;
+}
+
+static void updateZigbeeLinkStats(uint32_t now, bool force = false) {
+  if (!Zigbee.connected()) {
+    if (g_zigbeeLqi >= 0 || g_zigbeeShortAddr != 0xFFFF) {
+      Serial.println("[ZB] link stats reset: disconnected");
+      Serial.flush();
+    }
+    resetZigbeeLinkStats();
+    return;
+  }
+
+  if (!force && g_lastZigbeeLqiPoll && now - g_lastZigbeeLqiPoll < ZIGBEE_LQI_POLL_MS) return;
+  g_lastZigbeeLqiPoll = now;
+
+  if (!esp_zb_lock_acquire(pdMS_TO_TICKS(100))) {
+    Serial.println("[ZB] link stats skipped: Zigbee lock timeout");
+    Serial.flush();
+    return;
+  }
+
+  g_zigbeeChannel = esp_zb_get_current_channel();
+  g_zigbeeShortAddr = esp_zb_get_short_address();
+
+  esp_zb_nwk_info_iterator_t iterator = ESP_ZB_NWK_INFO_ITERATOR_INIT;
+  esp_zb_nwk_neighbor_info_t neighbor;
+  esp_err_t err = ESP_OK;
+  uint8_t count = 0;
+  bool found = false;
+  bool foundParent = false;
+  uint8_t selectedLqi = 0;
+  int8_t selectedRssi = 0;
+  uint16_t selectedShort = 0xFFFF;
+  uint8_t selectedRelationship = 0xFF;
+
+  while ((err = esp_zb_nwk_get_next_neighbor(&iterator, &neighbor)) == ESP_OK) {
+    ++count;
+    Serial.printf("[ZB] neighbor: short=0x%04X, relationship=%u, lqi=%u, rssi=%d, age=%u, outgoing_cost=%u\n",
+                  neighbor.short_addr,
+                  neighbor.relationship,
+                  neighbor.lqi,
+                  neighbor.rssi,
+                  neighbor.age,
+                  neighbor.outgoing_cost);
+
+    const bool isParent = neighbor.relationship == ESP_ZB_NWK_RELATIONSHIP_PARENT;
+    if (isParent || (!found && !foundParent) || (!foundParent && neighbor.lqi > selectedLqi)) {
+      found = true;
+      foundParent = isParent;
+      selectedLqi = neighbor.lqi;
+      selectedRssi = neighbor.rssi;
+      selectedShort = neighbor.short_addr;
+      selectedRelationship = neighbor.relationship;
+      if (isParent) break;
+    }
+  }
+
+  esp_zb_lock_release();
+
+  if (found) {
+    g_zigbeeLqi = selectedLqi;
+    g_zigbeeRssi = selectedRssi;
+    g_zigbeeParentShortAddr = selectedShort;
+    Serial.printf("[ZB] link: short=0x%04X, channel=%u, %s=0x%04X, lqi=%d, rssi=%d dBm, relationship=%u, neighbors=%u\n",
+                  g_zigbeeShortAddr,
+                  g_zigbeeChannel,
+                  foundParent ? "parent" : "best_neighbor",
+                  g_zigbeeParentShortAddr,
+                  g_zigbeeLqi,
+                  g_zigbeeRssi,
+                  selectedRelationship,
+                  count);
+  } else {
+    g_zigbeeLqi = -1;
+    g_zigbeeRssi = 0;
+    g_zigbeeParentShortAddr = 0xFFFF;
+    if (err == ESP_ERR_NOT_FOUND) {
+      Serial.printf("[ZB] link: no neighbors yet, short=0x%04X, channel=%u\n", g_zigbeeShortAddr, g_zigbeeChannel);
+    } else {
+      Serial.printf("[ZB] link: neighbor scan failed, err=0x%X, short=0x%04X, channel=%u\n",
+                    (unsigned)err,
+                    g_zigbeeShortAddr,
+                    g_zigbeeChannel);
+    }
+  }
+  Serial.flush();
+}
+
+static void configureZigbeeReporting() {
+  if (g_zigbeeReportingConfigured) return;
+
+  zbTempHum.setReporting(10, 300, 0.2f);
+  zbTempHum.setHumidityReporting(10, 300, 1.0f);
+  zbCO2.setReporting(0, 30, 0);
+  g_zigbeeReportingConfigured = true;
+  Serial.println("Zigbee reporting configured.");
+}
+
+static void updateCo2Alarm(uint16_t ppm) {
+  if (!zigbeeUsable()) return;
+
+  bool newAlarm = (ppm >= red_ppm);
+  if (newAlarm == g_alarm) return;
+
+  g_alarm = newAlarm;
+  zbAlarm.setBinaryInput(g_alarm);
+}
+
+static void updateZigbeeReady() {
+  const bool startedNow = Zigbee.started();
+  const bool connectedNow = Zigbee.connected();
+
+  if (startedNow && !g_zigbeeStarted) {
+    g_zigbeeStarted = true;
+    Serial.println("Zigbee stack became started after begin timeout.");
+    configureZigbeeReporting();
+  }
+
+  if (connectedNow != g_lastZigbeeConnected) {
+    g_lastZigbeeConnected = connectedNow;
+    g_forceEpaperUpdate = g_hasMeasurement;
+    Serial.printf("Zigbee connection state changed: %s\n", connectedNow ? "connected" : "disconnected");
+    if (!connectedNow) {
+      g_zclReady = false;
+      g_connectedAt = 0;
+      resetZigbeeLinkStats();
+    }
+  }
+
+  if (!g_zigbeeStarted || g_zclReady) return;
+
+  if (!connectedNow) {
+    g_connectedAt = 0;
+    return;
+  }
+
+  if (!g_connectedAt) {
+    g_connectedAt = millis();
+    Serial.println("Zigbee connected, waiting for ZCL...");
+    return;
+  }
+
+  if (millis() - g_connectedAt < ZIGBEE_READY_DELAY_MS) return;
+
+  g_zclReady = true;
+  g_forceEpaperUpdate = g_hasMeasurement;
+  updateZigbeeLinkStats(millis(), true);
+  zbAlarm.setBinaryInput(false);
+  zbLedDim.setLight(g_ledEnabled, g_ledLevel100);
+  onLedChange(g_ledEnabled, g_ledLevel100);
+  zbLedDim.restoreLight();
+  zbDisplayRefresh.setAnalogOutput((float)display_refresh_interval_minutes);
+  zbDisplayRefresh.reportAnalogOutput();
+
+  Serial.println("Zigbee ZCL ready.");
+}
+
+static void publishZigbeeValues(uint16_t co2ppm, float tempC, float rh) {
+  if (!zigbeeUsable()) return;
+
+  zbCO2.setCarbonDioxide((float)co2ppm);
+  zbTempHum.setTemperature(tempC);
+  zbTempHum.setHumidity(rh);
+}
+
+static void reportZigbeeValues(uint32_t now) {
+  if (!zigbeeUsable()) return;
+  if (now - lastReport < ZB_REPORT_MS) return;
+
+  lastReport = now;
+  zbCO2.report();
+  zbTempHum.report();
+  zbDisplayRefresh.reportAnalogOutput();
+  Serial.println("Zigbee report sent.");
+}
+
+// ---------- SCD4x ----------
+static bool initScd4x() {
+  Wire.begin(I2C_SDA, I2C_SCL);
+  scd4x.begin(Wire, SCD4X_I2C_ADDR);
+
+  uint16_t err = 0;
+  char errMsg[64];
+
+  (void)scd4x.stopPeriodicMeasurement();
+  delay(50);
+
+  err = scd4x.setAutomaticSelfCalibrationTarget(400);
+  if (err) {
+    errorToString(err, errMsg, sizeof(errMsg));
+    Serial.printf("SCD4x setASC target failed: %s\n", errMsg);
+  }
+
+  err = scd4x.startPeriodicMeasurement();
+  if (err) {
+    errorToString(err, errMsg, sizeof(errMsg));
+    Serial.printf("SCD4x startPeriodicMeasurement failed: %s\n", errMsg);
+    return false;
+  }
+
+  return true;
+}
+
+static bool readScd4x(uint16_t &co2ppm, float &tempC, float &rh) {
+  int16_t err = 0;
+  char errMsg[64];
+
+  bool dataReady = false;
+  err = scd4x.getDataReadyStatus(dataReady);
+  if (err) {
+    errorToString(err, errMsg, sizeof(errMsg));
+    Serial.printf("SCD4x getDataReadyStatus failed: %s\n", errMsg);
+    return false;
+  }
+  if (!dataReady) return false;
+
+  err = scd4x.readMeasurement(co2ppm, tempC, rh);
+  if (err) {
+    errorToString(err, errMsg, sizeof(errMsg));
+    Serial.printf("SCD4x readMeasurement failed: %s\n", errMsg);
+    return false;
+  }
+
+  if (co2ppm == 0) return false;
+  return true;
+}
+
+// ---------- Button ----------
+static void handleButton() {
+  if (digitalRead(button) != LOW) return;
+
+  delay(100);
+  uint32_t start = millis();
+
+  while (digitalRead(button) == LOW) {
+    delay(50);
+    if (millis() - start > 3000) {
+      Serial.println("Factory reset Zigbee + reboot...");
+      setLedRGB(120, 0, 0);
+      delay(300);
+      Zigbee.factoryReset();
+      ESP.restart();
+    }
+  }
+
+  if (g_hasMeasurement) {
+    Serial.println("Manual e-paper refresh requested by button.");
+    updateEpaper(g_lastCO2, g_lastTempC, g_lastRh, true);
+  } else {
+    Serial.println("Manual e-paper refresh skipped: no measurement yet.");
+  }
+
+  if (zigbeeUsable()) {
+    Serial.println("Manual Zigbee report()");
+    zbTempHum.report();
+    zbCO2.report();
+  } else {
+    Serial.println("Manual Zigbee report skipped: Zigbee is not ready.");
+  }
+}
+
+// ---------- Arduino ----------
+void setup() {
+  Serial.begin(115200);
+  const uint32_t serialStart = millis();
+  while (!Serial && millis() - serialStart < 2000) {
+    delay(10);
+  }
+  delay(200);
+
+  Serial.println();
+  Serial.println("Boot: ESP32-H2 SCD4x Zigbee + GDEY0154F51");
+  Serial.printf("Pins: I2C SDA=%u SCL=%u, LED=%u, EPD BUSY=%u RST=%u DC=%u CS=%u SCK=%u MOSI=%u\n",
+                I2C_SDA, I2C_SCL, WS2812_GPIO, EPD_BUSY_PIN, EPD_RST_PIN, EPD_DC_PIN, EPD_CS_PIN, EPD_SCK_PIN, EPD_MOSI_PIN);
+  Serial.printf("Intervals: sensor_poll=%lu ms, zigbee_report=%lu ms, display_refresh=%u min (%lu ms), lqi_poll=%lu ms\n",
+                (unsigned long)SENSOR_POLL_MS,
+                (unsigned long)ZB_REPORT_MS,
+                display_refresh_interval_minutes,
+                (unsigned long)epaperRefreshIntervalMs(),
+                (unsigned long)ZIGBEE_LQI_POLL_MS);
+  Serial.printf("EPD deltas: CO2=%u ppm, T=%.1f C, RH=%.1f %%\n",
+                EPAPER_CO2_DELTA_PPM, EPAPER_TEMP_DELTA_C, EPAPER_RH_DELTA);
+  Serial.println("Serial check: if you see this on COM5, USB CDC logging is active.");
+  Serial.flush();
+
+  pinMode(button, INPUT_PULLUP);
+
+  pixels.begin();
+  pixels.setBrightness(100);
+  pixels.clear();
+  pixels.show();
+  setLedRGB(0, 0, 60);
+
+  EPD_ioInit();
+  if (xTaskCreate(epaperTask, "epaper", 6144, nullptr, 1, &g_epaperTaskHandle) == pdPASS) {
+    Serial.println("[EPD] background task started.");
+  } else {
+    g_epaperTaskHandle = nullptr;
+    Serial.println("[EPD] background task failed; refresh will block the main loop.");
+  }
+  Serial.flush();
+
+  if (!initScd4x()) {
+    setLedRGB(80, 0, 80);
+  }
+
+  zbTempHum.setManufacturerAndModel("Custom", "ESP32H2_SCD4x");
+  zbTempHum.setMinMaxValue(-10, 60);
+  zbTempHum.setTolerance(0.2f);
+  zbTempHum.addHumiditySensor(0, 100, 1.0f);
+
+  zbCO2.setManufacturerAndModel("Custom", "ESP32H2_SCD4x");
+  zbCO2.setMinMaxValue(0, 10000);
+  zbCO2.setTolerance(50);
+
+  zbLedDim.setManufacturerAndModel("Custom", "ESP32H2_SCD4x_LED");
+  zbLedDim.onLightChange(onLedChange);
+
+  zbDisplayRefresh.setManufacturerAndModel("Custom", "ESP32H2_SCD4x_Display");
+  zbDisplayRefresh.addAnalogOutput();
+  zbDisplayRefresh.setAnalogOutputApplication(ESP_ZB_ZCL_AO_TIME_OTHER);
+  zbDisplayRefresh.setAnalogOutputDescription("Display refresh min");
+  zbDisplayRefresh.setAnalogOutputResolution(1.0f);
+  zbDisplayRefresh.setAnalogOutputMinMax((float)DISPLAY_REFRESH_INTERVAL_MIN, (float)DISPLAY_REFRESH_INTERVAL_MAX);
+  zbDisplayRefresh.setAnalogOutput((float)display_refresh_interval_minutes);
+  zbDisplayRefresh.onAnalogOutputChange(onDisplayRefreshChange);
+
+  zbAlarm.addBinaryInput();
+  zbAlarm.setBinaryInputApplication(BINARY_INPUT_APPLICATION_TYPE_SECURITY_CARBON_DIOXIDE_DETECTION);
+  zbAlarm.setBinaryInputDescription("CO2 alarm");
+
+  Zigbee.addEndpoint(&zbAlarm);
+  Zigbee.addEndpoint(&zbLedDim);
+  Zigbee.addEndpoint(&zbDisplayRefresh);
+  Zigbee.addEndpoint(&zbTempHum);
+  Zigbee.addEndpoint(&zbCO2);
+
+  Serial.println("Starting Zigbee...");
+  Zigbee.setTimeout(5000);
+  g_zigbeeStarted = Zigbee.begin();
+  if (g_zigbeeStarted) {
+    Serial.println("Zigbee stack started. Measurements continue while pairing/connecting.");
+    configureZigbeeReporting();
+  } else {
+    Serial.println("Zigbee start failed/timeout. Measurements continue locally.");
+  }
+
+  setLedRGB(0, 60, 0);
+}
+
+void loop() {
+  handleButton();
+  updateZigbeeReady();
+
+  const uint32_t now = millis();
+  updateZigbeeLinkStats(now);
+
+  if (now - lastPoll >= SENSOR_POLL_MS) {
+    lastPoll = now;
+
+    uint16_t co2ppm = 0;
+    float tempC = NAN;
+    float rh = NAN;
+
+    if (readScd4x(co2ppm, tempC, rh)) {
+      Serial.printf("SCD4x: CO2=%u ppm, T=%.2f C, RH=%.2f %%\n", co2ppm, tempC, rh);
+
+      g_lastCO2 = co2ppm;
+      g_lastTempC = tempC;
+      g_lastRh = rh;
+      g_hasMeasurement = true;
+
+      updateLedByCO2(co2ppm);
+      publishZigbeeValues(co2ppm, tempC, rh);
+      updateCo2Alarm(co2ppm);
+      reportZigbeeValues(now);
+      updateEpaper(co2ppm, tempC, rh, g_forceEpaperUpdate);
+      g_forceEpaperUpdate = false;
+    }
+  }
+
+  if (g_hasMeasurement) {
+    updateLedByCO2(g_lastCO2);
+  }
+
+  delay(20);
+}
