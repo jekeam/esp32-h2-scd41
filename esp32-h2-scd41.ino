@@ -1120,10 +1120,10 @@ static bool initScd4x() {
     Serial.printf("SCD4x setASC target failed: %s\n", errMsg);
   }
 
-  err = scd4x.startPeriodicMeasurement();
+  err = scd4x.startLowPowerPeriodicMeasurement();
   if (err) {
     errorToString(err, errMsg, sizeof(errMsg));
-    Serial.printf("SCD4x startPeriodicMeasurement failed: %s\n", errMsg);
+    Serial.printf("SCD4x startLowPowerPeriodicMeasurement failed: %s\n", errMsg);
     return false;
   }
 
