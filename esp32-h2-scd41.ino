@@ -1243,22 +1243,22 @@ void setup() {
     setLedRGB(80, 0, 80);
   }
 
-  zbTempHum.setManufacturerAndModel("Custom", "ESP32H2_SCD4x");
+  zbTempHum.setManufacturerAndModel("SAVA_Lab", "ESP32H2_SCD4x");
   zbTempHum.setMinMaxValue(-10, 60);
   zbTempHum.setTolerance(0.2f);
   zbTempHum.addHumiditySensor(0, 100, 1.0f);
 
   Zigbee.onGlobalDefaultResponse(onZigbeeDefaultResponse);
 
-  zbCO2.setManufacturerAndModel("Custom", "ESP32H2_SCD4x");
+  zbCO2.setManufacturerAndModel("SAVA_Lab", "ESP32H2_SCD4x");
   zbCO2.setMinMaxValue(0, 10000);
   zbCO2.setTolerance(50);
 
-  zbLedDim.setManufacturerAndModel("Custom", "ESP32H2_SCD4x_LED");
+  zbLedDim.setManufacturerAndModel("SAVA_Lab", "ESP32H2_SCD4x_LED");
   zbLedDim.onLightChange(onLedChange);
   zbLedDim.onIdentify(identify);
 
-  zbDisplayRefresh.setManufacturerAndModel("Custom", "ESP32H2_SCD4x_Display");
+  zbDisplayRefresh.setManufacturerAndModel("SAVA_Lab", "ESP32H2_SCD4x_Display");
   zbDisplayRefresh.addAnalogOutput();
   zbDisplayRefresh.setAnalogOutputApplication(ESP_ZB_ZCL_AO_TIME_OTHER);
   zbDisplayRefresh.setAnalogOutputDescription("Refresh min");
