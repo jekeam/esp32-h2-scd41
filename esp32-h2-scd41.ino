@@ -4,6 +4,10 @@
 
 #include <Wire.h>
 #include <Zigbee.h>
+#include <Preferences.h>
+#include <esp_zigbee_core.h>
+#include <esp_err.h>
+#include <esp_ieee802154.h>
 #include <nwk/esp_zigbee_nwk.h>
 #include <math.h>
 #include <string.h>
@@ -49,15 +53,106 @@ static uint16_t display_refresh_interval_minutes = DISPLAY_REFRESH_INTERVAL_DEFA
 static constexpr uint32_t EPAPER_SKIP_LOG_MS = 30000;
 static constexpr uint32_t ZIGBEE_LQI_POLL_MS = 10000;
 static constexpr uint32_t ZIGBEE_READY_DELAY_MS = 2000;
+static constexpr int8_t ZIGBEE_TX_POWER_DBM = 20;
 static constexpr uint16_t EPAPER_CO2_DELTA_PPM = 50;
 static constexpr float EPAPER_TEMP_DELTA_C = 0.5f;
 static constexpr float EPAPER_RH_DELTA = 2.0f;
+
+static constexpr bool LED_ENABLED_DEFAULT = true;
+static constexpr uint8_t LED_ZIGBEE_LEVEL_DEFAULT = 255;
 
 static uint32_t epaperRefreshIntervalMs() {
   const uint16_t minutes = display_refresh_interval_minutes
                              ? display_refresh_interval_minutes
                              : DISPLAY_REFRESH_INTERVAL_DEFAULT_MIN;
   return (uint32_t)minutes * 60UL * 1000UL;
+}
+
+static uint16_t clampDisplayRefreshMinutes(int32_t minutes) {
+  if (minutes < DISPLAY_REFRESH_INTERVAL_MIN) return DISPLAY_REFRESH_INTERVAL_MIN;
+  if (minutes > DISPLAY_REFRESH_INTERVAL_MAX) return DISPLAY_REFRESH_INTERVAL_MAX;
+  return (uint16_t)minutes;
+}
+
+static void loadDisplayRefreshInterval() {
+  Preferences prefs;
+  if (!prefs.begin("co2meter", true)) {
+    Serial.printf("[CFG] display refresh interval load failed, using default %u min\n",
+                  DISPLAY_REFRESH_INTERVAL_DEFAULT_MIN);
+    return;
+  }
+
+  const uint16_t saved = prefs.getUShort("refresh_min", DISPLAY_REFRESH_INTERVAL_DEFAULT_MIN);
+  prefs.end();
+
+  display_refresh_interval_minutes = clampDisplayRefreshMinutes(saved);
+  Serial.printf("[CFG] display refresh interval loaded: %u min",
+                display_refresh_interval_minutes);
+  if (saved != display_refresh_interval_minutes) {
+    Serial.printf(" (saved=%u clamped)", saved);
+  }
+  Serial.println();
+}
+
+static void saveDisplayRefreshInterval(uint16_t minutes) {
+  Preferences prefs;
+  if (!prefs.begin("co2meter", false)) {
+    Serial.printf("[CFG] display refresh interval save failed: %u min\n", minutes);
+    return;
+  }
+
+  const size_t written = prefs.putUShort("refresh_min", minutes);
+  prefs.end();
+
+  Serial.printf("[CFG] display refresh interval saved: %u min, result=%s\n",
+                minutes,
+                written ? "ok" : "FAIL");
+}
+
+static uint8_t ledZigbeeLevelToPercent(uint8_t level) {
+  return (uint8_t)(((uint16_t)level * 100U + 127U) / 255U);
+}
+
+static void loadLedState(bool &enabled, uint8_t &zigbeeLevel) {
+  Preferences prefs;
+  enabled = LED_ENABLED_DEFAULT;
+  zigbeeLevel = LED_ZIGBEE_LEVEL_DEFAULT;
+
+  if (!prefs.begin("co2meter", true)) {
+    Serial.printf("[CFG] LED state load failed, using default: on=%u, zb_level=%u\n",
+                  enabled ? 1 : 0,
+                  zigbeeLevel);
+    return;
+  }
+
+  enabled = prefs.getBool("led_on", LED_ENABLED_DEFAULT);
+  zigbeeLevel = prefs.getUChar("led_level", LED_ZIGBEE_LEVEL_DEFAULT);
+  prefs.end();
+
+  Serial.printf("[CFG] LED state loaded: on=%u, zb_level=%u, brightness=%u%%\n",
+                enabled ? 1 : 0,
+                zigbeeLevel,
+                ledZigbeeLevelToPercent(zigbeeLevel));
+}
+
+static void saveLedState(bool enabled, uint8_t zigbeeLevel) {
+  Preferences prefs;
+  if (!prefs.begin("co2meter", false)) {
+    Serial.printf("[CFG] LED state save failed: on=%u, zb_level=%u\n",
+                  enabled ? 1 : 0,
+                  zigbeeLevel);
+    return;
+  }
+
+  const size_t writtenOn = prefs.putBool("led_on", enabled);
+  const size_t writtenLevel = prefs.putUChar("led_level", zigbeeLevel);
+  prefs.end();
+
+  Serial.printf("[CFG] LED state saved: on=%u, zb_level=%u, brightness=%u%%, result=%s\n",
+                enabled ? 1 : 0,
+                zigbeeLevel,
+                ledZigbeeLevelToPercent(zigbeeLevel),
+                (writtenOn && writtenLevel) ? "ok" : "FAIL");
 }
 
 // ---------- PPM limits ----------
@@ -82,10 +177,16 @@ static const uint8_t button = BOOT_PIN;
 static bool g_zigbeeStarted = false;
 static bool g_zigbeeReportingConfigured = false;
 static bool g_zclReady = false;
+static bool g_zhaSeen = false;
+static bool g_zigbeeTxPowerConfigured = false;
+static bool g_zigbeeTxPowerAppliedAfterJoin = false;
 static bool g_lastZigbeeConnected = false;
 static bool g_forceEpaperUpdate = false;
 static bool g_displayRefreshAnalogSyncing = false;
 static bool g_displayRefreshAnalogSyncPending = false;
+static uint32_t g_identifyUntil = 0;
+static uint32_t g_lastIdentifyBlink = 0;
+static bool g_identifyBlinkOn = false;
 static uint32_t g_connectedAt = 0;
 static uint32_t g_lastZigbeeLqiPoll = 0;
 static int16_t g_zigbeeLqi = -1;
@@ -94,7 +195,8 @@ static uint8_t g_zigbeeChannel = 0;
 static uint16_t g_zigbeeShortAddr = 0xFFFF;
 static uint16_t g_zigbeeParentShortAddr = 0xFFFF;
 
-static bool g_ledEnabled = true;
+static bool g_ledEnabled = LED_ENABLED_DEFAULT;
+static uint8_t g_ledZigbeeLevel = LED_ZIGBEE_LEVEL_DEFAULT;
 static uint8_t g_ledLevel100 = 100;
 static bool g_alarm = false;
 
@@ -158,14 +260,52 @@ static void setLedRGB(uint8_t r, uint8_t g, uint8_t b) {
   pixels.show();
 }
 
-static void updateLedByCO2(uint16_t ppm) {
+static bool updateIdentifyLed() {
+  if (!g_identifyUntil) return false;
+
+  const uint32_t now = millis();
+  if (now >= g_identifyUntil) {
+    g_identifyUntil = 0;
+    g_identifyBlinkOn = false;
+    return false;
+  }
+
+  if (!g_lastIdentifyBlink || now - g_lastIdentifyBlink >= 250) {
+    g_lastIdentifyBlink = now;
+    g_identifyBlinkOn = !g_identifyBlinkOn;
+    pixels.setBrightness(120);
+    pixels.setPixelColor(0, g_identifyBlinkOn ? pixels.Color(180, 180, 180) : pixels.Color(0, 0, 0));
+    pixels.show();
+  }
+
+  return true;
+}
+
+static void updateLedIndicator() {
+  if (updateIdentifyLed()) return;
+
   if (!g_ledEnabled) {
     pixels.clear();
     pixels.show();
     return;
   }
 
-  uint8_t maxBr = (uint8_t)((uint16_t)g_ledLevel100 * 255 / 100);
+  if (!g_zigbeeStarted && !Zigbee.started()) {
+    pixels.setBrightness((uint8_t)((uint16_t)g_ledLevel100 * 255 / 100));
+    pixels.setPixelColor(0, pixels.Color(140, 0, 0));
+    pixels.show();
+    return;
+  }
+
+  if (!Zigbee.connected() || !g_zclReady || !g_zhaSeen || !g_hasMeasurement) {
+    pixels.setBrightness((uint8_t)((uint16_t)g_ledLevel100 * 255 / 100));
+    pixels.setPixelColor(0, pixels.Color(0, 0, 120));
+    pixels.show();
+    return;
+  }
+
+  const uint16_t ppm = g_lastCO2;
+  const uint8_t maxBr = (uint8_t)((uint16_t)g_ledLevel100 * 255 / 100);
 
   const float CO2_MIN = 400.0f;
   const float CO2_MAX = (float)red_ppm;
@@ -210,9 +350,16 @@ static void updateLedByCO2(uint16_t ppm) {
 }
 
 static void onLedChange(bool state, uint8_t level) {
+  const bool oldEnabled = g_ledEnabled;
+  const uint8_t oldLevel = g_ledZigbeeLevel;
+
   g_ledEnabled = state;
-  if (level > 100) level = 100;
-  g_ledLevel100 = level;
+  g_ledZigbeeLevel = level;
+  g_ledLevel100 = ledZigbeeLevelToPercent(g_ledZigbeeLevel);
+
+  if (oldEnabled != g_ledEnabled || oldLevel != g_ledZigbeeLevel) {
+    saveLedState(g_ledEnabled, g_ledZigbeeLevel);
+  }
 
   uint8_t b = (uint8_t)((uint16_t)g_ledLevel100 * 255 / 100);
   pixels.setBrightness(b);
@@ -220,7 +367,26 @@ static void onLedChange(bool state, uint8_t level) {
   if (!g_ledEnabled) {
     pixels.clear();
     pixels.show();
+  } else {
+    updateLedIndicator();
   }
+}
+
+static void identify(uint16_t time) {
+  Serial.printf("[ZB] identify requested for %u seconds\n", time);
+  Serial.flush();
+
+  if (time == 0) {
+    g_identifyUntil = 0;
+    g_identifyBlinkOn = false;
+    updateLedIndicator();
+    return;
+  }
+
+  g_identifyUntil = millis() + (uint32_t)time * 1000UL;
+  g_lastIdentifyBlink = 0;
+  g_identifyBlinkOn = false;
+  updateIdentifyLed();
 }
 
 static void onDisplayRefreshChange(float minutesValue) {
@@ -230,13 +396,16 @@ static void onDisplayRefreshChange(float minutesValue) {
   }
 
   int32_t rounded = (int32_t)roundf(minutesValue);
-  if (rounded < DISPLAY_REFRESH_INTERVAL_MIN) rounded = DISPLAY_REFRESH_INTERVAL_MIN;
-  if (rounded > DISPLAY_REFRESH_INTERVAL_MAX) rounded = DISPLAY_REFRESH_INTERVAL_MAX;
+  const uint16_t newMinutes = clampDisplayRefreshMinutes(rounded);
+  const bool changed = display_refresh_interval_minutes != newMinutes;
 
-  display_refresh_interval_minutes = (uint16_t)rounded;
+  display_refresh_interval_minutes = newMinutes;
   if (!g_displayRefreshAnalogSyncing) {
+    if (changed) {
+      saveDisplayRefreshInterval(display_refresh_interval_minutes);
+    }
     g_forceEpaperUpdate = g_hasMeasurement;
-    if (!isfinite(requestedValue) || fabsf(requestedValue - (float)rounded) > 0.01f) {
+    if (!isfinite(requestedValue) || fabsf(requestedValue - (float)newMinutes) > 0.01f) {
       g_displayRefreshAnalogSyncPending = true;
     }
   }
@@ -246,6 +415,24 @@ static void onDisplayRefreshChange(float minutesValue) {
                 requestedValue,
                 (unsigned long)epaperRefreshIntervalMs());
   Serial.flush();
+}
+
+static bool isOurZigbeeEndpoint(uint8_t endpoint) {
+  return endpoint == EP_TEMP_HUM ||
+         endpoint == EP_CO2 ||
+         endpoint == EP_LED_DIM ||
+         endpoint == EP_ALARM ||
+         endpoint == EP_DISPLAY_REFRESH;
+}
+
+static void onZigbeeDefaultResponse(zb_cmd_type_t resp_to_cmd, esp_zb_zcl_status_t status, uint8_t endpoint, uint16_t cluster) {
+  if (status != ESP_ZB_ZCL_STATUS_SUCCESS || !isOurZigbeeEndpoint(endpoint)) return;
+
+  if (!g_zhaSeen) {
+    Serial.printf("[ZB] coordinator responded: endpoint=%u, cluster=0x%04X, resp_to_cmd=0x%02X\n",
+                  endpoint, cluster, (uint8_t)resp_to_cmd);
+  }
+  g_zhaSeen = true;
 }
 
 // ---------- E-paper ----------
@@ -430,6 +617,9 @@ static void renderEpaperFrame(uint16_t co2ppm, float tempC, float rh, const char
 
   epdCanvas.setTextWrap(false);
   drawRefreshMarker(5, 18, frameSeq, ppmTextColor);
+
+  snprintf(buf, sizeof(buf), "%u min", display_refresh_interval_minutes);
+  printTextAt(68, 20, 1, buf, EPD_COLOR_BLACK, false);
 
   drawZigbeeStats(lqi, rssi, linkTextColor);
 
@@ -661,6 +851,28 @@ static bool zigbeeUsable() {
   return g_zigbeeStarted && g_zclReady && Zigbee.connected();
 }
 
+static void applyZigbeeTxPower(const char *reason) {
+  esp_err_t err = esp_ieee802154_set_txpower(ZIGBEE_TX_POWER_DBM);
+  int8_t actualPower = esp_ieee802154_get_txpower();
+
+  if (err == ESP_OK) {
+    Serial.printf("[ZB] TX power requested: %d dBm (%s), current: %d dBm\n",
+                  ZIGBEE_TX_POWER_DBM, reason, actualPower);
+  } else {
+    Serial.printf("[ZB] TX power request failed: %s (%s), current: %d dBm\n",
+                  esp_err_to_name(err), reason, actualPower);
+  }
+  Serial.flush();
+}
+
+static void configureZigbeeTxPower() {
+  if (g_zigbeeTxPowerConfigured) return;
+  if (!g_zigbeeStarted && !Zigbee.started()) return;
+
+  applyZigbeeTxPower("stack started");
+  g_zigbeeTxPowerConfigured = true;
+}
+
 static void resetZigbeeLinkStats() {
   g_zigbeeLqi = -1;
   g_zigbeeRssi = 0;
@@ -783,18 +995,33 @@ static void updateZigbeeReady() {
   if (startedNow && !g_zigbeeStarted) {
     g_zigbeeStarted = true;
     Serial.println("Zigbee stack became started after begin timeout.");
+    configureZigbeeTxPower();
     configureZigbeeReporting();
   }
+
+  configureZigbeeTxPower();
 
   if (connectedNow != g_lastZigbeeConnected) {
     g_lastZigbeeConnected = connectedNow;
     g_forceEpaperUpdate = g_hasMeasurement;
     Serial.printf("Zigbee connection state changed: %s\n", connectedNow ? "connected" : "disconnected");
+    g_zhaSeen = false;
+    if (connectedNow) {
+      applyZigbeeTxPower("joined coordinator");
+      g_zigbeeTxPowerAppliedAfterJoin = true;
+    } else {
+      g_zigbeeTxPowerAppliedAfterJoin = false;
+    }
     if (!connectedNow) {
       g_zclReady = false;
       g_connectedAt = 0;
       resetZigbeeLinkStats();
     }
+  }
+
+  if (connectedNow && !g_zigbeeTxPowerAppliedAfterJoin) {
+    applyZigbeeTxPower("joined coordinator");
+    g_zigbeeTxPowerAppliedAfterJoin = true;
   }
 
   if (!g_zigbeeStarted || g_zclReady) return;
@@ -814,10 +1041,10 @@ static void updateZigbeeReady() {
 
   g_zclReady = true;
   g_forceEpaperUpdate = g_hasMeasurement;
+  lastReport = millis() - ZB_REPORT_MS;
   updateZigbeeLinkStats(millis(), true);
   zbAlarm.setBinaryInput(false);
-  zbLedDim.setLight(g_ledEnabled, g_ledLevel100);
-  onLedChange(g_ledEnabled, g_ledLevel100);
+  zbLedDim.setLight(g_ledEnabled, g_ledZigbeeLevel);
   zbLedDim.restoreLight();
   syncDisplayRefreshAnalogOutput("zcl-ready", true);
 
@@ -937,10 +1164,17 @@ static void handleButton() {
   while (digitalRead(button) == LOW) {
     delay(50);
     if (millis() - start > 3000) {
-      Serial.println("Factory reset Zigbee + reboot...");
+      Serial.println("Factory reset Zigbee NVRAM requested. Release BOOT to reboot...");
       setLedRGB(120, 0, 0);
-      delay(300);
-      Zigbee.factoryReset();
+      Serial.flush();
+      Zigbee.factoryReset(false);
+      delay(1000);
+      while (digitalRead(button) == LOW) {
+        delay(20);
+      }
+      delay(100);
+      Serial.println("Rebooting after Zigbee factory reset.");
+      Serial.flush();
       ESP.restart();
     }
   }
@@ -972,8 +1206,11 @@ void setup() {
 
   Serial.println();
   Serial.println("Boot: ESP32-H2 SCD4x Zigbee + GDEY0154F51");
-  Serial.printf("Pins: I2C SDA=%u SCL=%u, LED=%u, EPD BUSY=%u RST=%u DC=%u CS=%u SCK=%u MOSI=%u\n",
-                I2C_SDA, I2C_SCL, WS2812_GPIO, EPD_BUSY_PIN, EPD_RST_PIN, EPD_DC_PIN, EPD_CS_PIN, EPD_SCK_PIN, EPD_MOSI_PIN);
+  loadDisplayRefreshInterval();
+  loadLedState(g_ledEnabled, g_ledZigbeeLevel);
+  g_ledLevel100 = ledZigbeeLevelToPercent(g_ledZigbeeLevel);
+  Serial.printf("Pins: I2C SDA=%u SCL=%u, LED=%u, BOOT=%u, EPD BUSY=%u RST=%u DC=%u CS=%u SCK=%u MOSI=%u\n",
+                I2C_SDA, I2C_SCL, WS2812_GPIO, button, EPD_BUSY_PIN, EPD_RST_PIN, EPD_DC_PIN, EPD_CS_PIN, EPD_SCK_PIN, EPD_MOSI_PIN);
   Serial.printf("Intervals: sensor_poll=%lu ms, zigbee_report=%lu ms, display_refresh=%u min (%lu ms), lqi_poll=%lu ms\n",
                 (unsigned long)SENSOR_POLL_MS,
                 (unsigned long)ZB_REPORT_MS,
@@ -988,10 +1225,10 @@ void setup() {
   pinMode(button, INPUT_PULLUP);
 
   pixels.begin();
-  pixels.setBrightness(100);
+  pixels.setBrightness((uint8_t)((uint16_t)g_ledLevel100 * 255 / 100));
   pixels.clear();
   pixels.show();
-  setLedRGB(0, 0, 60);
+  updateLedIndicator();
 
   EPD_ioInit();
   if (xTaskCreate(epaperTask, "epaper", 6144, nullptr, 1, &g_epaperTaskHandle) == pdPASS) {
@@ -1011,12 +1248,15 @@ void setup() {
   zbTempHum.setTolerance(0.2f);
   zbTempHum.addHumiditySensor(0, 100, 1.0f);
 
+  Zigbee.onGlobalDefaultResponse(onZigbeeDefaultResponse);
+
   zbCO2.setManufacturerAndModel("Custom", "ESP32H2_SCD4x");
   zbCO2.setMinMaxValue(0, 10000);
   zbCO2.setTolerance(50);
 
   zbLedDim.setManufacturerAndModel("Custom", "ESP32H2_SCD4x_LED");
   zbLedDim.onLightChange(onLedChange);
+  zbLedDim.onIdentify(identify);
 
   zbDisplayRefresh.setManufacturerAndModel("Custom", "ESP32H2_SCD4x_Display");
   zbDisplayRefresh.addAnalogOutput();
@@ -1030,6 +1270,11 @@ void setup() {
   zbAlarm.setBinaryInputApplication(BINARY_INPUT_APPLICATION_TYPE_SECURITY_CARBON_DIOXIDE_DETECTION);
   zbAlarm.setBinaryInputDescription("CO2 alarm");
 
+  zbTempHum.onIdentify(identify);
+  zbCO2.onIdentify(identify);
+  zbAlarm.onIdentify(identify);
+  zbDisplayRefresh.onIdentify(identify);
+
   addZigbeeEndpointChecked("CO2 alarm BinaryInput", &zbAlarm);
   addZigbeeEndpointChecked("LED DimmableLight", &zbLedDim);
   addZigbeeEndpointChecked("Display refresh AnalogOutput", &zbDisplayRefresh);
@@ -1041,19 +1286,21 @@ void setup() {
   g_zigbeeStarted = Zigbee.begin();
   if (g_zigbeeStarted) {
     Serial.println("Zigbee stack started. Measurements continue while pairing/connecting.");
+    configureZigbeeTxPower();
     syncDisplayRefreshAnalogOutput("stack-started", false);
     configureZigbeeReporting();
   } else {
     Serial.println("Zigbee start failed/timeout. Measurements continue locally.");
   }
 
-  setLedRGB(0, 60, 0);
+  updateLedIndicator();
 }
 
 void loop() {
   handleButton();
   updateZigbeeReady();
   serviceDisplayRefreshAnalogSync();
+  updateLedIndicator();
 
   const uint32_t now = millis();
   updateZigbeeLinkStats(now);
@@ -1073,17 +1320,12 @@ void loop() {
       g_lastRh = rh;
       g_hasMeasurement = true;
 
-      updateLedByCO2(co2ppm);
       publishZigbeeValues(co2ppm, tempC, rh);
       updateCo2Alarm(co2ppm);
       reportZigbeeValues(now);
       updateEpaper(co2ppm, tempC, rh, g_forceEpaperUpdate);
       g_forceEpaperUpdate = false;
     }
-  }
-
-  if (g_hasMeasurement) {
-    updateLedByCO2(g_lastCO2);
   }
 
   delay(20);
