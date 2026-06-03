@@ -8,6 +8,7 @@
 #include <esp_zigbee_core.h>
 #include <esp_err.h>
 #include <esp_ieee802154.h>
+#include <esp_sleep.h>
 #include <nwk/esp_zigbee_nwk.h>
 #include <math.h>
 #include <string.h>
@@ -46,6 +47,14 @@ static constexpr uint8_t SCD4X_I2C_ADDR = 0x62;
 // ---------- Timing ----------
 static constexpr uint32_t SENSOR_POLL_MS = 1000;
 static constexpr uint32_t ZB_REPORT_MS = 30000;
+static constexpr uint32_t DEEP_SLEEP_INTERVAL_MS = 2UL * 60UL * 1000UL;
+static constexpr uint32_t DEEP_SLEEP_ZIGBEE_READY_MS = 90000;
+static constexpr uint32_t DEEP_SLEEP_REPORT_ACK_MS = 12000;
+static constexpr uint32_t DEEP_SLEEP_REPORT_RETRY_MS = 3000;
+static constexpr uint32_t DEEP_SLEEP_RETRY_AWAKE_MS = 15000;
+static constexpr uint32_t ZIGBEE_BEGIN_RESTART_DELAY_MS = 15000;
+static constexpr uint32_t ZIGBEE_PAIRING_INTERVIEW_WAIT_MS = 180000;
+static constexpr uint8_t DEEP_SLEEP_REPORT_ATTEMPTS = 3;
 static constexpr uint16_t DISPLAY_REFRESH_INTERVAL_MIN = 1;
 static constexpr uint16_t DISPLAY_REFRESH_INTERVAL_MAX = 60;
 static constexpr uint16_t DISPLAY_REFRESH_INTERVAL_DEFAULT_MIN = 1;
@@ -178,6 +187,7 @@ static bool g_zigbeeStarted = false;
 static bool g_zigbeeReportingConfigured = false;
 static bool g_zclReady = false;
 static bool g_zhaSeen = false;
+static bool g_co2ReportAckSeen = false;
 static bool g_zigbeeTxPowerConfigured = false;
 static bool g_zigbeeTxPowerAppliedAfterJoin = false;
 static bool g_lastZigbeeConnected = false;
@@ -199,6 +209,9 @@ static bool g_ledEnabled = LED_ENABLED_DEFAULT;
 static uint8_t g_ledZigbeeLevel = LED_ZIGBEE_LEVEL_DEFAULT;
 static uint8_t g_ledLevel100 = 100;
 static bool g_alarm = false;
+static bool g_deepCycleStarted = false;
+static uint32_t g_setupDoneAt = 0;
+static bool g_lastEpaperRefreshOk = false;
 
 static uint16_t g_lastCO2 = 0;
 static float g_lastTempC = NAN;
@@ -215,6 +228,7 @@ static float lastEpaperRh = NAN;
 static uint8_t lastEpaperBand = 255;
 static bool hasEpaperMeasurement = false;
 static uint32_t g_epaperFrameSeq = 0;
+RTC_DATA_ATTR static uint32_t g_rtcEpaperFrameSeq = 0;
 
 static uint8_t epdFrame[EPD_FRAME_BYTES];
 
@@ -433,6 +447,10 @@ static void onZigbeeDefaultResponse(zb_cmd_type_t resp_to_cmd, esp_zb_zcl_status
                   endpoint, cluster, (uint8_t)resp_to_cmd);
   }
   g_zhaSeen = true;
+
+  if (endpoint == EP_CO2) {
+    g_co2ReportAckSeen = true;
+  }
 }
 
 // ---------- E-paper ----------
@@ -569,7 +587,7 @@ static void drawSignalBarsIcon(int16_t right, int16_t y, uint8_t bars, uint16_t 
 
 static void drawRefreshMarker(int16_t x, int16_t y, uint32_t frameSeq, uint8_t color) {
   char marker[8];
-  snprintf(marker, sizeof(marker), "R%02lu", (unsigned long)(frameSeq % 100));
+  snprintf(marker, sizeof(marker), "R%03lu", (unsigned long)(frameSeq % 1000));
 
   printTextAt(x, y, 2, marker, EPD_COLOR_BLACK);
 
@@ -616,10 +634,9 @@ static void renderEpaperFrame(uint16_t co2ppm, float tempC, float rh, const char
   epdCanvas.drawFastHLine(0, 34, EPD_WIDTH, EPD_COLOR_BLACK);
 
   epdCanvas.setTextWrap(false);
-  drawRefreshMarker(5, 18, frameSeq, ppmTextColor);
 
-  snprintf(buf, sizeof(buf), "%u min", display_refresh_interval_minutes);
-  printTextAt(68, 20, 1, buf, EPD_COLOR_BLACK, false);
+  snprintf(buf, sizeof(buf), "%umin", display_refresh_interval_minutes);
+  printTextAt(8, 20, 1, buf, EPD_COLOR_BLACK, false);
 
   drawZigbeeStats(lqi, rssi, linkTextColor);
 
@@ -653,6 +670,62 @@ static void renderEpaperFrame(uint16_t co2ppm, float tempC, float rh, const char
     statusLabel = "ALARM";
   }
   printTextAt(8, 141, 1, statusLabel, statusText);
+}
+
+static void renderEpaperTestPattern(uint32_t frameSeq) {
+  char buf[24];
+
+  epdCanvas.clear(EPD_COLOR_WHITE);
+  epdCanvas.fillRect(0, 0, EPD_WIDTH / 2, EPD_HEIGHT / 2, EPD_COLOR_BLACK);
+  epdCanvas.fillRect(EPD_WIDTH / 2, 0, EPD_WIDTH / 2, EPD_HEIGHT / 2, EPD_COLOR_RED);
+  epdCanvas.fillRect(0, EPD_HEIGHT / 2, EPD_WIDTH / 2, EPD_HEIGHT / 2, EPD_COLOR_YELLOW);
+  epdCanvas.fillRect(EPD_WIDTH / 2, EPD_HEIGHT / 2, EPD_WIDTH / 2, EPD_HEIGHT / 2, EPD_COLOR_WHITE);
+
+  epdCanvas.drawRect(0, 0, EPD_WIDTH, EPD_HEIGHT, EPD_COLOR_BLACK);
+  epdCanvas.drawFastVLine(EPD_WIDTH / 2, 0, EPD_HEIGHT, EPD_COLOR_BLACK);
+  epdCanvas.drawFastHLine(0, EPD_HEIGHT / 2, EPD_WIDTH, EPD_COLOR_BLACK);
+
+  snprintf(buf, sizeof(buf), "EPD TEST");
+  printTextAt(8, 12, 2, buf, EPD_COLOR_WHITE, true);
+  snprintf(buf, sizeof(buf), "%lu", (unsigned long)(millis() / 1000UL));
+  printTextAt(88, 104, 2, buf, EPD_COLOR_BLACK, true);
+}
+
+static void runEpaperTestPattern() {
+  const uint32_t refreshStart = millis();
+  Serial.println("[EPD] TEST pattern start.");
+  Serial.flush();
+
+  g_rtcEpaperFrameSeq = (g_rtcEpaperFrameSeq + 1) % 1000;
+  g_epaperFrameSeq = g_rtcEpaperFrameSeq;
+  renderEpaperTestPattern(g_epaperFrameSeq);
+  Serial.printf("[EPD] TEST render done, frame=%lu\n", (unsigned long)g_epaperFrameSeq);
+  Serial.flush();
+
+  bool epdOk = false;
+  for (uint8_t attempt = 1; attempt <= 2; ++attempt) {
+    Serial.printf("[EPD] hardware attempt %u/2\n", attempt);
+    Serial.flush();
+    EPD_ioInit();
+    if (EPD_init() && EPD_displayNative(epdFrame)) {
+      epdOk = true;
+      break;
+    }
+    Serial.printf("[EPD] hardware attempt %u failed; resetting display interface\n", attempt);
+    Serial.flush();
+    delay(500);
+  }
+
+  if (!epdOk) {
+    Serial.printf("[EPD] cycle failed, total=%lu ms\n", (unsigned long)(millis() - refreshStart));
+    Serial.flush();
+    return;
+  }
+
+  EPD_sleep();
+
+  Serial.printf("[EPD] TEST pattern done, total=%lu ms\n", (unsigned long)(millis() - refreshStart));
+  Serial.flush();
 }
 
 static bool epaperBusyOrPending() {
@@ -724,6 +797,7 @@ static void finishEpaperRefreshJob() {
 
 static void runEpaperRefresh(uint16_t co2ppm, float tempC, float rh, bool force, bool firstDraw, bool periodicReady,
                              uint8_t previousBand, uint8_t currentBand, int16_t lqi, int8_t rssi, const char *zigbeeLabel) {
+  g_lastEpaperRefreshOk = false;
   const uint32_t refreshStart = millis();
   Serial.printf("[EPD] cycle start: co2=%u ppm, temp=%.2f C, rh=%.2f %%, force=%u, firstDraw=%u, periodicReady=%u, band=%u->%u, lqi=%d, rssi=%d, label=%s\n",
                 co2ppm, tempC, rh, force ? 1 : 0, firstDraw ? 1 : 0, periodicReady ? 1 : 0, previousBand, currentBand, lqi, rssi, zigbeeLabel);
@@ -731,15 +805,35 @@ static void runEpaperRefresh(uint16_t co2ppm, float tempC, float rh, bool force,
   Serial.flush();
 
   const uint32_t renderStart = millis();
-  const uint32_t frameSeq = ++g_epaperFrameSeq;
+  g_rtcEpaperFrameSeq = (g_rtcEpaperFrameSeq + 1) % 1000;
+  g_epaperFrameSeq = g_rtcEpaperFrameSeq;
+  const uint32_t frameSeq = g_epaperFrameSeq;
   renderEpaperFrame(co2ppm, tempC, rh, zigbeeLabel, lqi, rssi, frameSeq);
   Serial.printf("[EPD] render frame done, frame=%lu, elapsed=%lu ms\n",
                 (unsigned long)frameSeq,
                 (unsigned long)(millis() - renderStart));
   Serial.flush();
 
-  EPD_init();
-  EPD_displayNative(epdFrame);
+  bool epdOk = false;
+  for (uint8_t attempt = 1; attempt <= 2; ++attempt) {
+    Serial.printf("[EPD] hardware attempt %u/2\n", attempt);
+    Serial.flush();
+    EPD_ioInit();
+    if (EPD_init() && EPD_displayNative(epdFrame)) {
+      epdOk = true;
+      break;
+    }
+    Serial.printf("[EPD] hardware attempt %u failed; resetting display interface\n", attempt);
+    Serial.flush();
+    delay(500);
+  }
+
+  if (!epdOk) {
+    Serial.printf("[EPD] cycle failed, total=%lu ms\n", (unsigned long)(millis() - refreshStart));
+    Serial.flush();
+    return;
+  }
+
   EPD_sleep();
 
   lastEpaper = millis();
@@ -748,6 +842,7 @@ static void runEpaperRefresh(uint16_t co2ppm, float tempC, float rh, bool force,
   lastEpaperRh = rh;
   lastEpaperBand = currentBand;
   hasEpaperMeasurement = true;
+  g_lastEpaperRefreshOk = true;
 
   Serial.printf("[EPD] cycle done, total=%lu ms\n", (unsigned long)(millis() - refreshStart));
   Serial.flush();
@@ -1120,13 +1215,6 @@ static bool initScd4x() {
     Serial.printf("SCD4x setASC target failed: %s\n", errMsg);
   }
 
-  err = scd4x.startLowPowerPeriodicMeasurement();
-  if (err) {
-    errorToString(err, errMsg, sizeof(errMsg));
-    Serial.printf("SCD4x startLowPowerPeriodicMeasurement failed: %s\n", errMsg);
-    return false;
-  }
-
   return true;
 }
 
@@ -1154,6 +1242,212 @@ static bool readScd4x(uint16_t &co2ppm, float &tempC, float &rh) {
   return true;
 }
 
+static bool readScd4xSingleShot(uint16_t &co2ppm, float &tempC, float &rh) {
+  int16_t err = 0;
+  char errMsg[64];
+
+  (void)scd4x.stopPeriodicMeasurement();
+  delay(500);
+
+  err = scd4x.wakeUp();
+  if (err) {
+    errorToString(err, errMsg, sizeof(errMsg));
+    Serial.printf("SCD4x wakeUp warning: %s\n", errMsg);
+  }
+  delay(20);
+
+  err = scd4x.measureAndReadSingleShot(co2ppm, tempC, rh);
+  if (err) {
+    errorToString(err, errMsg, sizeof(errMsg));
+    Serial.printf("SCD4x measureAndReadSingleShot failed: %s\n", errMsg);
+    (void)scd4x.powerDown();
+    return false;
+  }
+
+  err = scd4x.powerDown();
+  if (err) {
+    errorToString(err, errMsg, sizeof(errMsg));
+    Serial.printf("SCD4x powerDown warning: %s\n", errMsg);
+  }
+
+  if (co2ppm == 0 || !isfinite(tempC) || !isfinite(rh)) return false;
+  return true;
+}
+
+static void handleButton();
+
+static void enterDeepSleep(uint32_t sleepMs) {
+  pixels.clear();
+  pixels.show();
+  Serial.printf("[PWR] deep sleep for %lu ms\n", (unsigned long)sleepMs);
+  Serial.flush();
+  delay(50);
+  esp_sleep_enable_timer_wakeup((uint64_t)sleepMs * 1000ULL);
+  esp_deep_sleep_start();
+}
+
+static void waitForZigbeeBegin() {
+  handleButton();
+
+  Serial.println("Starting Zigbee...");
+  Serial.flush();
+
+  g_zigbeeStarted = Zigbee.begin();
+  if (g_zigbeeStarted) return;
+
+  Serial.println("Zigbee begin timeout; restarting, no second begin().");
+  Serial.flush();
+  updateLedIndicator();
+
+  const uint32_t restartAt = millis() + ZIGBEE_BEGIN_RESTART_DELAY_MS;
+  while (millis() - restartAt < 0x80000000UL) {
+    handleButton();
+    updateLedIndicator();
+    delay(50);
+  }
+
+  ESP.restart();
+}
+
+static bool waitForZigbeeReady(uint32_t timeoutMs) {
+  const uint32_t start = millis();
+  while (millis() - start < timeoutMs) {
+    updateZigbeeReady();
+    updateZigbeeLinkStats(millis());
+    updateLedIndicator();
+    if (zigbeeUsable()) return true;
+    delay(100);
+  }
+  return zigbeeUsable();
+}
+
+static bool sendDeepSleepReportAndWaitAck(uint32_t timeoutMs) {
+  const uint32_t start = millis();
+  uint32_t lastAttempt = 0;
+  uint8_t attempts = 0;
+
+  g_co2ReportAckSeen = false;
+
+  while (millis() - start < timeoutMs) {
+    const uint32_t now = millis();
+    updateZigbeeReady();
+    updateZigbeeLinkStats(now);
+    updateLedIndicator();
+
+    if (zigbeeUsable() &&
+        attempts < DEEP_SLEEP_REPORT_ATTEMPTS &&
+        (!lastAttempt || now - lastAttempt >= DEEP_SLEEP_REPORT_RETRY_MS)) {
+      attempts++;
+      lastAttempt = now;
+      publishZigbeeValues(g_lastCO2, g_lastTempC, g_lastRh);
+      updateCo2Alarm(g_lastCO2);
+      lastReport = now - ZB_REPORT_MS;
+      reportZigbeeValues(now);
+      Serial.printf("[ZB] deep-sleep CO2 report attempt %u/%u\n",
+                    attempts,
+                    DEEP_SLEEP_REPORT_ATTEMPTS);
+      Serial.flush();
+    }
+
+    if (g_co2ReportAckSeen) {
+      Serial.println("[ZB] CO2 report ACK seen.");
+      Serial.flush();
+      return true;
+    }
+
+    delay(100);
+  }
+
+  Serial.printf("[ZB] CO2 report ACK not seen, attempts=%u\n", attempts);
+  Serial.flush();
+  return false;
+}
+
+static bool waitAwakeUntilZhaSeen(uint32_t timeoutMs) {
+  Serial.printf("[ZB] waiting for HA/coordinator response, timeout=%lu ms; deep sleep disabled.\n",
+                (unsigned long)timeoutMs);
+  Serial.flush();
+
+  const uint32_t start = millis();
+  while (millis() - start < timeoutMs) {
+    handleButton();
+    updateZigbeeReady();
+    updateLedIndicator();
+
+    if (g_zhaSeen || g_co2ReportAckSeen) {
+      Serial.println("[ZB] HA/coordinator response seen.");
+      Serial.flush();
+      return true;
+    }
+
+    delay(250);
+  }
+
+  Serial.println("[ZB] HA/coordinator response timeout.");
+  Serial.flush();
+  return false;
+}
+
+static void stayAwakeNoDeepSleep() {
+  Serial.println("[ZB] staying awake; deep sleep disabled.");
+  Serial.flush();
+
+  while (true) {
+    handleButton();
+    updateZigbeeReady();
+    updateLedIndicator();
+    delay(250);
+  }
+}
+
+static void runDeepSleepCycle() {
+  display_refresh_interval_minutes = 2;
+
+  const bool measurementOk = g_hasMeasurement && g_lastCO2 != 0 && isfinite(g_lastTempC) && isfinite(g_lastRh);
+
+  bool zigbeeReadyOk = false;
+  bool pairedOk = false;
+
+  if (measurementOk && waitForZigbeeReady(DEEP_SLEEP_ZIGBEE_READY_MS)) {
+    zigbeeReadyOk = true;
+    pairedOk = (g_zhaSeen || g_co2ReportAckSeen) ||
+               waitAwakeUntilZhaSeen(ZIGBEE_PAIRING_INTERVIEW_WAIT_MS);
+  } else if (measurementOk) {
+    pairedOk = waitAwakeUntilZhaSeen(ZIGBEE_PAIRING_INTERVIEW_WAIT_MS);
+    zigbeeReadyOk = true;
+  }
+
+  if (pairedOk) {
+    pairedOk = true;
+    Serial.printf("[ZB] deep-sleep cycle CO2 report window %lu ms\n", (unsigned long)DEEP_SLEEP_REPORT_ACK_MS);
+    (void)sendDeepSleepReportAndWaitAck(DEEP_SLEEP_REPORT_ACK_MS);
+  }
+
+  if (measurementOk) {
+    char zbLabel[12];
+    formatZigbeeLabel(zbLabel, sizeof(zbLabel));
+    runEpaperRefresh(g_lastCO2, g_lastTempC, g_lastRh, true, !hasEpaperMeasurement, true,
+                     lastEpaperBand, airQualityBand(g_lastCO2), g_zigbeeLqi, g_zigbeeRssi, zbLabel);
+    if (!g_lastEpaperRefreshOk) {
+      enterDeepSleep(DEEP_SLEEP_RETRY_AWAKE_MS);
+    }
+  }
+
+  if (!measurementOk) {
+    enterDeepSleep(DEEP_SLEEP_RETRY_AWAKE_MS);
+  }
+
+  if (!zigbeeReadyOk) {
+    pairedOk = waitAwakeUntilZhaSeen(ZIGBEE_PAIRING_INTERVIEW_WAIT_MS);
+  }
+
+  if (!pairedOk) {
+    stayAwakeNoDeepSleep();
+  }
+
+  enterDeepSleep(DEEP_SLEEP_INTERVAL_MS);
+}
+
 // ---------- Button ----------
 static void handleButton() {
   if (digitalRead(button) != LOW) return;
@@ -1179,12 +1473,8 @@ static void handleButton() {
     }
   }
 
-  if (g_hasMeasurement) {
-    Serial.println("Manual e-paper refresh requested by button.");
-    updateEpaper(g_lastCO2, g_lastTempC, g_lastRh, true);
-  } else {
-    Serial.println("Manual e-paper refresh skipped: no measurement yet.");
-  }
+  Serial.println("Manual EPD TEST pattern requested by button.");
+  runEpaperTestPattern();
 
   if (zigbeeUsable()) {
     Serial.println("Manual Zigbee report()");
@@ -1207,6 +1497,7 @@ void setup() {
   Serial.println();
   Serial.println("Boot: ESP32-H2 SCD4x Zigbee + GDEY0154F51");
   loadDisplayRefreshInterval();
+  display_refresh_interval_minutes = 2;
   loadLedState(g_ledEnabled, g_ledZigbeeLevel);
   g_ledLevel100 = ledZigbeeLevelToPercent(g_ledZigbeeLevel);
   Serial.printf("Pins: I2C SDA=%u SCL=%u, LED=%u, BOOT=%u, EPD BUSY=%u RST=%u DC=%u CS=%u SCK=%u MOSI=%u\n",
@@ -1241,6 +1532,23 @@ void setup() {
 
   if (!initScd4x()) {
     setLedRGB(80, 0, 80);
+  } else {
+    uint16_t co2ppm = 0;
+    float tempC = NAN;
+    float rh = NAN;
+    if (readScd4xSingleShot(co2ppm, tempC, rh)) {
+      g_lastCO2 = co2ppm;
+      g_lastTempC = tempC;
+      g_lastRh = rh;
+      g_hasMeasurement = true;
+      Serial.printf("SCD4x single-shot: CO2=%u ppm, T=%.2f C, RH=%.2f %%\n", co2ppm, tempC, rh);
+    } else {
+      Serial.println("SCD4x single-shot failed before Zigbee start.");
+    }
+  }
+
+  if (!g_hasMeasurement) {
+    enterDeepSleep(DEEP_SLEEP_RETRY_AWAKE_MS);
   }
 
   zbTempHum.setManufacturerAndModel("Custom", "ESP32H2_SCD4x");
@@ -1281,11 +1589,17 @@ void setup() {
   addZigbeeEndpointChecked("Temperature/Humidity", &zbTempHum);
   addZigbeeEndpointChecked("CO2 measurement", &zbCO2);
 
-  Serial.println("Starting Zigbee...");
-  Zigbee.setTimeout(5000);
-  g_zigbeeStarted = Zigbee.begin();
+  Zigbee.setTimeout(DEEP_SLEEP_ZIGBEE_READY_MS);
+  Zigbee.setRxOnWhenIdle(true);
+  Serial.println("[ZB] RX-on-idle enabled for pairing/interview.");
+  waitForZigbeeBegin();
   if (g_zigbeeStarted) {
     Serial.println("Zigbee stack started. Measurements continue while pairing/connecting.");
+    zbCO2.setCarbonDioxide((float)g_lastCO2);
+    zbTempHum.setTemperature(g_lastTempC);
+    zbTempHum.setHumidity(g_lastRh);
+    g_alarm = (g_lastCO2 >= red_ppm);
+    zbAlarm.setBinaryInput(g_alarm);
     configureZigbeeTxPower();
     syncDisplayRefreshAnalogOutput("stack-started", false);
     configureZigbeeReporting();
@@ -1294,38 +1608,22 @@ void setup() {
   }
 
   updateLedIndicator();
+  g_setupDoneAt = millis();
+  Serial.println("[BOOT] setup done; loop will keep Zigbee alive before deep cycle.");
+  Serial.flush();
 }
 
 void loop() {
   handleButton();
   updateZigbeeReady();
-  serviceDisplayRefreshAnalogSync();
   updateLedIndicator();
 
   const uint32_t now = millis();
   updateZigbeeLinkStats(now);
 
-  if (now - lastPoll >= SENSOR_POLL_MS) {
-    lastPoll = now;
-
-    uint16_t co2ppm = 0;
-    float tempC = NAN;
-    float rh = NAN;
-
-    if (readScd4x(co2ppm, tempC, rh)) {
-      Serial.printf("SCD4x: CO2=%u ppm, T=%.2f C, RH=%.2f %%\n", co2ppm, tempC, rh);
-
-      g_lastCO2 = co2ppm;
-      g_lastTempC = tempC;
-      g_lastRh = rh;
-      g_hasMeasurement = true;
-
-      publishZigbeeValues(co2ppm, tempC, rh);
-      updateCo2Alarm(co2ppm);
-      reportZigbeeValues(now);
-      updateEpaper(co2ppm, tempC, rh, g_forceEpaperUpdate);
-      g_forceEpaperUpdate = false;
-    }
+  if (!g_deepCycleStarted && now - g_setupDoneAt >= 30000) {
+    g_deepCycleStarted = true;
+    runDeepSleepCycle();
   }
 
   delay(20);

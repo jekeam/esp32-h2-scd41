@@ -12,10 +12,10 @@ static constexpr uint16_t EPD_WIDTH = 152;
 static constexpr uint16_t EPD_HEIGHT = 152;
 static constexpr uint16_t EPD_FRAME_BYTES = EPD_WIDTH * EPD_HEIGHT / 4;
 
-void EPD_init(void);
+bool EPD_init(void);
 void EPD_sleep(void);
-void EPD_refresh(void);
+bool EPD_refresh(void);
 bool EPD_waitReady(const char *phase, uint32_t timeoutMs = 60000);
-void EPD_displayNative(const uint8_t *frame);
+bool EPD_displayNative(const uint8_t *frame);
 
 #endif

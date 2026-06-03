@@ -21,17 +21,42 @@ bool EPD_waitReady(const char *phase, uint32_t timeoutMs) {
   return true;
 }
 
-void EPD_init(void) {
+static bool EPD_waitBusyCycle(const char *phase, uint32_t activeTimeoutMs, uint32_t readyTimeoutMs) {
+  const uint32_t start = millis();
+  Serial.printf("[EPD] BUSY cycle wait begin: %s, pin=%d, active_timeout=%lu ms, ready_timeout=%lu ms\n",
+                phase, digitalRead(EPD_BUSY_PIN), (unsigned long)activeTimeoutMs, (unsigned long)readyTimeoutMs);
+  Serial.flush();
+
+  while (digitalRead(EPD_BUSY_PIN) != LOW) {
+    delay(2);
+    yield();
+    if (millis() - start > activeTimeoutMs) {
+      Serial.printf("[EPD] BUSY cycle TIMEOUT: %s never became active, elapsed=%lu ms, pin=%d\n",
+                    phase, (unsigned long)(millis() - start), digitalRead(EPD_BUSY_PIN));
+      Serial.flush();
+      return false;
+    }
+  }
+
+  return EPD_waitReady(phase, readyTimeoutMs);
+}
+
+bool EPD_init(void) {
   const uint32_t start = millis();
   Serial.println("[EPD] init begin");
   Serial.flush();
-  delay(20);
+  digitalWrite(EPD_CS_PIN, HIGH);
+  digitalWrite(EPD_DC_PIN, HIGH);
   digitalWrite(EPD_RST_PIN, LOW);
-  delay(40);
+  delay(200);
   digitalWrite(EPD_RST_PIN, HIGH);
-  delay(50);
+  delay(200);
 
-  EPD_waitReady("after reset");
+  if (!EPD_waitReady("after reset")) {
+    Serial.println("[EPD] init abort: BUSY stuck after reset");
+    Serial.flush();
+    return false;
+  }
 
   Serial.println("[EPD] init commands begin");
   Serial.flush();
@@ -91,9 +116,14 @@ void EPD_init(void) {
   EPD_W21_WriteDATA(0x08);
 
   EPD_W21_WriteCMD(0x04);
-  EPD_waitReady("power on");
+  if (!EPD_waitBusyCycle("power on", 1000, 60000)) {
+    Serial.println("[EPD] init abort: BUSY stuck during power on");
+    Serial.flush();
+    return false;
+  }
   Serial.printf("[EPD] init done, elapsed=%lu ms\n", (unsigned long)(millis() - start));
   Serial.flush();
+  return true;
 }
 
 void EPD_sleep(void) {
@@ -110,18 +140,23 @@ void EPD_sleep(void) {
   Serial.flush();
 }
 
-void EPD_refresh(void) {
+bool EPD_refresh(void) {
   const uint32_t start = millis();
   Serial.println("[EPD] refresh command begin");
   Serial.flush();
   EPD_W21_WriteCMD(0x12);
   EPD_W21_WriteDATA(0x00);
-  EPD_waitReady("display refresh");
+  if (!EPD_waitBusyCycle("display refresh", 1000, 60000)) {
+    Serial.println("[EPD] refresh abort: BUSY stuck during display refresh");
+    Serial.flush();
+    return false;
+  }
   Serial.printf("[EPD] refresh command done, elapsed=%lu ms\n", (unsigned long)(millis() - start));
   Serial.flush();
+  return true;
 }
 
-void EPD_displayNative(const uint8_t *frame) {
+bool EPD_displayNative(const uint8_t *frame) {
   const uint32_t start = millis();
   Serial.printf("[EPD] frame write begin, bytes=%u\n", EPD_FRAME_BYTES);
   Serial.flush();
@@ -129,5 +164,5 @@ void EPD_displayNative(const uint8_t *frame) {
   EPD_W21_WriteDATA_Bulk(frame, EPD_FRAME_BYTES);
   Serial.printf("[EPD] frame write done, elapsed=%lu ms\n", (unsigned long)(millis() - start));
   Serial.flush();
-  EPD_refresh();
+  return EPD_refresh();
 }
