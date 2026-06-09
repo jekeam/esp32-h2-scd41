@@ -46,7 +46,7 @@ static constexpr uint8_t SCD4X_I2C_ADDR = 0x62;
 // ---------- Timing ----------
 static constexpr uint32_t SENSOR_POLL_MS = 1000;
 static constexpr uint32_t ZB_REPORT_MS = 30000;
-static constexpr uint32_t DEEP_SLEEP_INTERVAL_MS = 2UL * 60UL * 1000UL;
+static constexpr uint32_t DEEP_SLEEP_INTERVAL_MS = 10UL * 60UL * 1000UL;
 static constexpr uint32_t DEEP_SLEEP_ZIGBEE_READY_MS = 90000;
 static constexpr uint32_t DEEP_SLEEP_REPORT_ACK_MS = 12000;
 static constexpr uint32_t DEEP_SLEEP_REPORT_RETRY_MS = 3000;
@@ -328,6 +328,8 @@ static uint8_t epdFrame[EPD_FRAME_BYTES];
 
 static portMUX_TYPE g_epaperMux = portMUX_INITIALIZER_UNLOCKED;
 static TaskHandle_t g_epaperTaskHandle = nullptr;
+static TaskHandle_t g_buttonTaskHandle = nullptr;
+static volatile bool g_factoryResetInProgress = false;
 static volatile bool g_epaperJobPending = false;
 static volatile bool g_epaperRefreshBusy = false;
 static uint16_t g_epaperJobCO2 = 0;
@@ -766,62 +768,6 @@ static void renderEpaperFrame(uint16_t co2ppm, float tempC, float rh, const char
     statusLabel = "ALARM";
   }
   printTextAt(8, 141, 1, statusLabel, statusText);
-}
-
-static void renderEpaperTestPattern(uint32_t frameSeq) {
-  char buf[24];
-
-  epdCanvas.clear(EPD_COLOR_WHITE);
-  epdCanvas.fillRect(0, 0, EPD_WIDTH / 2, EPD_HEIGHT / 2, EPD_COLOR_BLACK);
-  epdCanvas.fillRect(EPD_WIDTH / 2, 0, EPD_WIDTH / 2, EPD_HEIGHT / 2, EPD_COLOR_RED);
-  epdCanvas.fillRect(0, EPD_HEIGHT / 2, EPD_WIDTH / 2, EPD_HEIGHT / 2, EPD_COLOR_YELLOW);
-  epdCanvas.fillRect(EPD_WIDTH / 2, EPD_HEIGHT / 2, EPD_WIDTH / 2, EPD_HEIGHT / 2, EPD_COLOR_WHITE);
-
-  epdCanvas.drawRect(0, 0, EPD_WIDTH, EPD_HEIGHT, EPD_COLOR_BLACK);
-  epdCanvas.drawFastVLine(EPD_WIDTH / 2, 0, EPD_HEIGHT, EPD_COLOR_BLACK);
-  epdCanvas.drawFastHLine(0, EPD_HEIGHT / 2, EPD_WIDTH, EPD_COLOR_BLACK);
-
-  snprintf(buf, sizeof(buf), "EPD TEST");
-  printTextAt(8, 12, 2, buf, EPD_COLOR_WHITE, true);
-  snprintf(buf, sizeof(buf), "%lu", (unsigned long)(millis() / 1000UL));
-  printTextAt(88, 104, 2, buf, EPD_COLOR_BLACK, true);
-}
-
-static void runEpaperTestPattern() {
-  const uint32_t refreshStart = millis();
-  Serial.println("[EPD] TEST pattern start.");
-  Serial.flush();
-
-  g_rtcEpaperFrameSeq = (g_rtcEpaperFrameSeq + 1) % 1000;
-  g_epaperFrameSeq = g_rtcEpaperFrameSeq;
-  renderEpaperTestPattern(g_epaperFrameSeq);
-  Serial.printf("[EPD] TEST render done, frame=%lu\n", (unsigned long)g_epaperFrameSeq);
-  Serial.flush();
-
-  bool epdOk = false;
-  for (uint8_t attempt = 1; attempt <= 2; ++attempt) {
-    Serial.printf("[EPD] hardware attempt %u/2\n", attempt);
-    Serial.flush();
-    EPD_ioInit();
-    if (EPD_init() && EPD_displayNative(epdFrame)) {
-      epdOk = true;
-      break;
-    }
-    Serial.printf("[EPD] hardware attempt %u failed; resetting display interface\n", attempt);
-    Serial.flush();
-    delay(500);
-  }
-
-  if (!epdOk) {
-    Serial.printf("[EPD] cycle failed, total=%lu ms\n", (unsigned long)(millis() - refreshStart));
-    Serial.flush();
-    return;
-  }
-
-  EPD_sleep();
-
-  Serial.printf("[EPD] TEST pattern done, total=%lu ms\n", (unsigned long)(millis() - refreshStart));
-  Serial.flush();
 }
 
 static bool epaperBusyOrPending() {
@@ -1694,7 +1640,7 @@ static void waitAwakeUntilMeasurementAndEpaperOk() {
 }
 
 static void runDeepSleepCycle() {
-  display_refresh_interval_minutes = 2;
+  display_refresh_interval_minutes = 10;
 
   const bool measurementOk = g_hasMeasurement && g_lastCO2 != 0 && isfinite(g_lastTempC) && isfinite(g_lastRh);
 
@@ -1740,44 +1686,67 @@ static void runDeepSleepCycle() {
 }
 
 // ---------- Button ----------
+static void performZigbeeFactoryReset() {
+  if (g_factoryResetInProgress) return;
+  g_factoryResetInProgress = true;
+
+  Serial.println("Factory reset Zigbee NVRAM requested. Release BOOT; reboot will continue automatically.");
+  setLedRGB(120, 0, 0);
+  Serial.flush();
+  g_haAdded = false;
+  g_haInterviewOk = false;
+  g_deepSleepAllowed = false;
+  saveHaAddedState(false);
+  saveHaInterviewOkState(false);
+  Zigbee.factoryReset(false);
+  delay(1000);
+  while (digitalRead(button) == LOW) {
+    delay(20);
+  }
+  delay(100);
+  Serial.println("Rebooting after Zigbee factory reset.");
+  Serial.flush();
+  ESP.restart();
+}
+
 static void handleButton() {
   if (digitalRead(button) != LOW) return;
 
   delay(100);
-  uint32_t start = millis();
-
+  const uint32_t start = millis();
   while (digitalRead(button) == LOW) {
-    delay(50);
     if (millis() - start > 3000) {
-      Serial.println("Factory reset Zigbee NVRAM requested. Release BOOT to reboot...");
-      setLedRGB(120, 0, 0);
-      Serial.flush();
-      g_haAdded = false;
-      g_haInterviewOk = false;
-      g_deepSleepAllowed = false;
-      saveHaAddedState(false);
-      saveHaInterviewOkState(false);
-      Zigbee.factoryReset(false);
-      delay(1000);
-      while (digitalRead(button) == LOW) {
-        delay(20);
-      }
-      delay(100);
-      Serial.println("Rebooting after Zigbee factory reset.");
-      Serial.flush();
-      ESP.restart();
+      performZigbeeFactoryReset();
     }
+    delay(50);
   }
 
-  Serial.println("Manual EPD TEST pattern requested by button.");
-  runEpaperTestPattern();
+  Serial.println("BOOT short press ignored.");
+  Serial.flush();
+}
 
-  if (zigbeeUsable()) {
-    Serial.println("Manual Zigbee report()");
-    zbTempHum.report();
-    zbCO2.report();
-  } else {
-    Serial.println("Manual Zigbee report skipped: Zigbee is not ready.");
+static void buttonTask(void *parameter) {
+  (void)parameter;
+
+  bool wasLow = false;
+  uint32_t lowStart = 0;
+
+  for (;;) {
+    const bool low = digitalRead(button) == LOW;
+    const uint32_t now = millis();
+
+    if (low) {
+      if (!wasLow) {
+        wasLow = true;
+        lowStart = now;
+      } else if (now - lowStart > 3000) {
+        performZigbeeFactoryReset();
+      }
+    } else {
+      wasLow = false;
+    }
+
+    vTaskDelay(pdMS_TO_TICKS(50));
   }
 }
 
@@ -1793,7 +1762,7 @@ void setup() {
   Serial.println();
   Serial.println("Boot: ESP32-H2 SCD4x Zigbee + GDEY0154F51");
   loadDisplayRefreshInterval();
-  display_refresh_interval_minutes = 2;
+  display_refresh_interval_minutes = 10;
   loadLedState(g_ledEnabled, g_ledZigbeeLevel);
   g_haAdded = loadHaAddedState();
   g_haInterviewOk = loadHaInterviewOkState();
@@ -1827,6 +1796,14 @@ void setup() {
   pixels.clear();
   pixels.show();
   updateLedIndicator();
+  if (xTaskCreate(buttonTask, "button", 4096, nullptr, 2, &g_buttonTaskHandle) == pdPASS) {
+    Serial.println("[BOOT] button task started.");
+  } else {
+    g_buttonTaskHandle = nullptr;
+    Serial.println("[BOOT] button task failed; button is polled by main loop only.");
+  }
+  Serial.flush();
+  handleButton();
 
   EPD_ioInit();
   if (xTaskCreate(epaperTask, "epaper", 6144, nullptr, 1, &g_epaperTaskHandle) == pdPASS) {
