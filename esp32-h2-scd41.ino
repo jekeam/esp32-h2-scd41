@@ -1244,11 +1244,13 @@ static bool initScd4x() {
   (void)scd4x.stopPeriodicMeasurement();
   delay(50);
 
-  err = scd4x.setAutomaticSelfCalibrationTarget(400);
+  err = scd4x.setAutomaticSelfCalibrationEnabled(false);
   if (err) {
     errorToString(err, errMsg, sizeof(errMsg));
-    Serial.printf("SCD4x setASC target failed: %s\n", errMsg);
+    Serial.printf("SCD4x ASC disable failed: %s\n", errMsg);
+    return false;
   }
+  Serial.println("SCD4x ASC disabled.");
 
   return true;
 }
@@ -1577,15 +1579,24 @@ static void waitAwakeUntilDeepSleepReportAck() {
 }
 
 static void markEpaperRecoveryNeeded() {
+  if (!g_epaperRecoveryNeeded) {
+    g_lastEpaperRecoveryAttempt = millis();
+  }
   g_epaperRecoveryNeeded = true;
-  g_lastEpaperRecoveryAttempt = 0;
-  Serial.println("[EPD] display refresh failed; deep sleep disabled, recovery will retry while Zigbee runs.");
+  Serial.printf("[EPD] display refresh failed; next recovery attempt in %lu ms.\n",
+                (unsigned long)epaperRefreshIntervalMs());
   Serial.flush();
 }
 
 static void serviceEpaperRecovery(uint32_t now) {
   if ((!g_epaperRecoveryNeeded && g_lastEpaperRefreshOk) || !g_hasMeasurement) return;
-  if (g_lastEpaperRecoveryAttempt && now - g_lastEpaperRecoveryAttempt < EPAPER_RECOVERY_RETRY_MS) return;
+  if (epaperBusyOrPending()) return;
+
+  uint32_t retryIntervalMs = epaperRefreshIntervalMs();
+  if (retryIntervalMs < EPAPER_RECOVERY_RETRY_MS) {
+    retryIntervalMs = EPAPER_RECOVERY_RETRY_MS;
+  }
+  if (g_lastEpaperRecoveryAttempt && now - g_lastEpaperRecoveryAttempt < retryIntervalMs) return;
 
   char zbLabel[12];
   formatZigbeeLabel(zbLabel, sizeof(zbLabel));
@@ -1594,6 +1605,8 @@ static void serviceEpaperRecovery(uint32_t now) {
   g_lastEpaperRecoveryAttempt = millis();
   if (g_lastEpaperRefreshOk) {
     g_epaperRecoveryNeeded = false;
+    g_deepCycleStarted = false;
+    g_setupDoneAt = millis();
     Serial.println("[EPD] display recovery succeeded.");
     Serial.flush();
   }
@@ -1644,7 +1657,7 @@ static void runDeepSleepCycle() {
 
   const bool measurementOk = g_hasMeasurement && g_lastCO2 != 0 && isfinite(g_lastTempC) && isfinite(g_lastRh);
 
-  if (measurementOk) {
+  if (measurementOk && !g_lastEpaperRefreshOk && !g_epaperRecoveryNeeded) {
     char zbLabel[12];
     formatZigbeeLabel(zbLabel, sizeof(zbLabel));
     runEpaperRefresh(g_lastCO2, g_lastTempC, g_lastRh, true, !hasEpaperMeasurement, true,
@@ -1686,12 +1699,47 @@ static void runDeepSleepCycle() {
 }
 
 // ---------- Button ----------
+static bool performScd4xFactoryReset() {
+  int16_t err = 0;
+  char errMsg[64];
+
+  err = scd4x.wakeUp();
+  if (err) {
+    errorToString(err, errMsg, sizeof(errMsg));
+    Serial.printf("[RESET] SCD41 wakeUp warning: %s\n", errMsg);
+  }
+  delay(30);
+
+  err = scd4x.stopPeriodicMeasurement();
+  if (err) {
+    errorToString(err, errMsg, sizeof(errMsg));
+    Serial.printf("[RESET] SCD41 stop warning: %s\n", errMsg);
+  }
+  delay(500);
+
+  err = scd4x.performFactoryReset();
+  if (err) {
+    errorToString(err, errMsg, sizeof(errMsg));
+    Serial.printf("[RESET] SCD41 factory reset failed: %s\n", errMsg);
+    Serial.flush();
+    return false;
+  }
+
+  delay(1200);
+  Serial.println("[RESET] SCD41 factory reset: ok");
+  Serial.flush();
+  return true;
+}
+
 static void performZigbeeFactoryReset() {
   if (g_factoryResetInProgress) return;
   g_factoryResetInProgress = true;
 
   Serial.println("Factory reset Zigbee NVRAM requested. Release BOOT; reboot will continue automatically.");
   setLedRGB(120, 0, 0);
+  Serial.flush();
+  const bool scd4xResetOk = performScd4xFactoryReset();
+  Serial.printf("[RESET] SCD41 result=%s\n", scd4xResetOk ? "ok" : "FAIL");
   Serial.flush();
   g_haAdded = false;
   g_haInterviewOk = false;
