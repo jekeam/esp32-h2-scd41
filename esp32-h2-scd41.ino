@@ -64,7 +64,7 @@ static uint16_t display_refresh_interval_minutes = DISPLAY_REFRESH_INTERVAL_DEFA
 static constexpr uint32_t EPAPER_SKIP_LOG_MS = 30000;
 static constexpr uint32_t ZIGBEE_LQI_POLL_MS = 10000;
 static constexpr uint32_t ZIGBEE_READY_DELAY_MS = 2000;
-static constexpr int8_t ZIGBEE_TX_POWER_DBM = 20;
+static constexpr int8_t ZIGBEE_TX_POWER_DBM = 9;
 static constexpr uint16_t EPAPER_CO2_DELTA_PPM = 50;
 static constexpr float EPAPER_TEMP_DELTA_C = 0.5f;
 static constexpr float EPAPER_RH_DELTA = 2.0f;
@@ -1293,6 +1293,19 @@ static bool readScd4xSingleShot(uint16_t &co2ppm, float &tempC, float &rh) {
   }
   delay(20);
 
+  // Discard the first reading after wake-up to let the sensor stabilize.
+  uint16_t discardedCO2 = 0;
+  float discardedTemp = NAN;
+  float discardedRh = NAN;
+  err = scd4x.measureAndReadSingleShot(discardedCO2, discardedTemp, discardedRh);
+  if (err) {
+    errorToString(err, errMsg, sizeof(errMsg));
+    Serial.printf("SCD4x stabilization measurement failed: %s\n", errMsg);
+    (void)scd4x.powerDown();
+    return false;
+  }
+  Serial.printf("SCD4x stabilization reading discarded: CO2=%u ppm\n", discardedCO2);
+
   err = scd4x.measureAndReadSingleShot(co2ppm, tempC, rh);
   if (err) {
     errorToString(err, errMsg, sizeof(errMsg));
@@ -1672,9 +1685,8 @@ static void runDeepSleepCycle() {
   }
 
   if (g_epaperRecoveryNeeded) {
-    Serial.println("[EPD] deep-sleep cycle paused until display recovery succeeds.");
+    Serial.println("[EPD] display unavailable; continuing Zigbee report and deep-sleep cycle.");
     Serial.flush();
-    return;
   }
 
   if (!waitForZigbeeReady(DEEP_SLEEP_ZIGBEE_READY_MS)) {

@@ -2,9 +2,8 @@
 
 #include "Display_EPD_W21_spi.h"
 
-static constexpr uint32_t EPD_DISPLAY_REFRESH_READY_TIMEOUT_MS = 30000;
-static constexpr uint32_t EPD_POWER_ON_READY_TIMEOUT_MS = 3000;
-static bool g_epdBusyLineStuckLow = false;
+static constexpr uint32_t EPD_BUSY_ACTIVE_TIMEOUT_MS = 1000;
+static constexpr uint32_t EPD_BUSY_READY_TIMEOUT_MS = 60000;
 
 bool EPD_waitReady(const char *phase, uint32_t timeoutMs) {
   const uint32_t start = millis();
@@ -25,17 +24,37 @@ bool EPD_waitReady(const char *phase, uint32_t timeoutMs) {
   return true;
 }
 
+static bool EPD_waitBusyCycle(const char *phase) {
+  const uint32_t start = millis();
+  Serial.printf("[EPD] BUSY cycle wait begin: %s, pin=%d, active_timeout=%lu ms, ready_timeout=%lu ms\n",
+                phase, digitalRead(EPD_BUSY_PIN), (unsigned long)EPD_BUSY_ACTIVE_TIMEOUT_MS,
+                (unsigned long)EPD_BUSY_READY_TIMEOUT_MS);
+  Serial.flush();
+
+  while (digitalRead(EPD_BUSY_PIN) != LOW) {
+    delay(2);
+    yield();
+    if (millis() - start > EPD_BUSY_ACTIVE_TIMEOUT_MS) {
+      Serial.printf("[EPD] BUSY cycle TIMEOUT: %s never became active, elapsed=%lu ms, pin=%d\n",
+                    phase, (unsigned long)(millis() - start), digitalRead(EPD_BUSY_PIN));
+      Serial.flush();
+      return false;
+    }
+  }
+
+  return EPD_waitReady(phase, EPD_BUSY_READY_TIMEOUT_MS);
+}
+
 bool EPD_init(void) {
   const uint32_t start = millis();
   Serial.println("[EPD] init begin");
   Serial.flush();
-  g_epdBusyLineStuckLow = false;
   digitalWrite(EPD_CS_PIN, HIGH);
   digitalWrite(EPD_DC_PIN, HIGH);
   digitalWrite(EPD_RST_PIN, LOW);
-  delay(40);
+  delay(200);
   digitalWrite(EPD_RST_PIN, HIGH);
-  delay(50);
+  delay(200);
 
   if (!EPD_waitReady("after reset")) {
     Serial.println("[EPD] init warning: BUSY stuck after reset; continuing like legacy driver");
@@ -100,10 +119,10 @@ bool EPD_init(void) {
   EPD_W21_WriteDATA(0x08);
 
   EPD_W21_WriteCMD(0x04);
-  if (!EPD_waitReady("power on", EPD_POWER_ON_READY_TIMEOUT_MS)) {
-    g_epdBusyLineStuckLow = true;
-    Serial.println("[EPD] init warning: BUSY stuck low during power on; using timed refresh fallback");
+  if (!EPD_waitBusyCycle("power on")) {
+    Serial.println("[EPD] init abort: BUSY cycle failed during power on");
     Serial.flush();
+    return false;
   }
   Serial.printf("[EPD] init done, elapsed=%lu ms\n", (unsigned long)(millis() - start));
   Serial.flush();
@@ -115,11 +134,7 @@ void EPD_sleep(void) {
   Serial.println("[EPD] sleep begin");
   Serial.flush();
   EPD_W21_WriteCMD(0x02);
-  if (g_epdBusyLineStuckLow) {
-    EPD_waitReady("power off", 3000);
-  } else {
-    EPD_waitReady("power off");
-  }
+  EPD_waitReady("power off");
   delay(100);
 
   EPD_W21_WriteCMD(0x07);
@@ -134,16 +149,8 @@ bool EPD_refresh(void) {
   Serial.flush();
   EPD_W21_WriteCMD(0x12);
   EPD_W21_WriteDATA(0x00);
-  if (g_epdBusyLineStuckLow) {
-    Serial.println("[EPD] timed display refresh wait begin: BUSY line stuck low");
-    Serial.flush();
-    delay(5000);
-    Serial.printf("[EPD] timed display refresh wait done, elapsed=%lu ms\n", (unsigned long)(millis() - start));
-    Serial.flush();
-    return false;
-  }
-  if (!EPD_waitReady("display refresh", EPD_DISPLAY_REFRESH_READY_TIMEOUT_MS)) {
-    Serial.println("[EPD] refresh failed: BUSY stuck during display refresh");
+  if (!EPD_waitBusyCycle("display refresh")) {
+    Serial.println("[EPD] refresh failed: BUSY cycle failed during display refresh");
     Serial.flush();
     return false;
   }
