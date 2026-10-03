@@ -9,6 +9,7 @@
 #include <esp_err.h>
 #include <esp_ieee802154.h>
 #include <esp_sleep.h>
+#include <esp_system.h>
 #include <nwk/esp_zigbee_nwk.h>
 #include <math.h>
 #include <string.h>
@@ -23,6 +24,7 @@
 
 #include "Display_EPD_W21.h"
 #include "Display_EPD_W21_spi.h"
+#include "EpaperRefreshPolicy.h"
 
 // ---------- Pins ----------
 #define I2C_SDA 10  // ESP32-H2 Super Mini
@@ -46,7 +48,7 @@ static constexpr uint8_t SCD4X_I2C_ADDR = 0x62;
 // ---------- Timing ----------
 static constexpr uint32_t SENSOR_POLL_MS = 1000;
 static constexpr uint32_t ZB_REPORT_MS = 30000;
-static constexpr uint32_t DEEP_SLEEP_INTERVAL_MS = 10UL * 60UL * 1000UL;
+static constexpr uint32_t DEEP_SLEEP_INTERVAL_MS = epaper_policy::kCycleMs;
 static constexpr uint32_t DEEP_SLEEP_ZIGBEE_READY_MS = 90000;
 static constexpr uint32_t DEEP_SLEEP_REPORT_ACK_MS = 12000;
 static constexpr uint32_t DEEP_SLEEP_REPORT_RETRY_MS = 3000;
@@ -323,6 +325,29 @@ static uint8_t lastEpaperBand = 255;
 static bool hasEpaperMeasurement = false;
 static uint32_t g_epaperFrameSeq = 0;
 RTC_DATA_ATTR static uint32_t g_rtcEpaperFrameSeq = 0;
+RTC_DATA_ATTR static epaper_policy::State g_rtcEpaper;
+static uint32_t g_epaperPolicyBaseMs = 0;
+
+static void restoreEpaperState() {
+  const bool deepWake = esp_reset_reason() == ESP_RST_DEEPSLEEP;
+  const bool timerWake = esp_sleep_get_wakeup_cause() == ESP_SLEEP_WAKEUP_TIMER;
+  if (!isfinite(g_rtcEpaper.lastDisplayedTemp) || !isfinite(g_rtcEpaper.lastDisplayedRh)) {
+    g_rtcEpaper.magic = 0;
+  }
+  epaper_policy::beginWake(g_rtcEpaper, deepWake, timerWake);
+  g_epaperPolicyBaseMs = millis();
+  hasEpaperMeasurement = g_rtcEpaper.hasFrame;
+  if (hasEpaperMeasurement) {
+    lastEpaperCO2 = g_rtcEpaper.lastDisplayedCo2;
+    lastEpaperTempC = g_rtcEpaper.lastDisplayedTemp;
+    lastEpaperRh = g_rtcEpaper.lastDisplayedRh;
+    lastEpaperBand = g_rtcEpaper.lastDisplayedZone;
+  }
+  g_epaperRecoveryNeeded = g_rtcEpaper.retryNeeded;
+  Serial.printf("[EPD] RTC: deep_wake=%u, timer=%u, frame=%u, cycles=%u/6, zone=%u, retry=%u\n",
+                deepWake, timerWake, hasEpaperMeasurement, g_rtcEpaper.cyclesSinceEpd,
+                g_rtcEpaper.lastDisplayedZone, g_epaperRecoveryNeeded);
+}
 
 static uint8_t epdFrame[EPD_FRAME_BYTES];
 
@@ -840,6 +865,8 @@ static void finishEpaperRefreshJob() {
 static void runEpaperRefresh(uint16_t co2ppm, float tempC, float rh, bool force, bool firstDraw, bool periodicReady,
                              uint8_t previousBand, uint8_t currentBand, int16_t lqi, int8_t rssi, const char *zigbeeLabel) {
   g_lastEpaperRefreshOk = false;
+  // Preserve the last successful frame if a refresh fails or the MCU resets midway.
+  g_rtcEpaper.retryNeeded = true;
   const uint32_t refreshStart = millis();
   Serial.printf("[EPD] cycle start: co2=%u ppm, temp=%.2f C, rh=%.2f %%, force=%u, firstDraw=%u, periodicReady=%u, band=%u->%u, lqi=%d, rssi=%d, label=%s\n",
                 co2ppm, tempC, rh, force ? 1 : 0, firstDraw ? 1 : 0, periodicReady ? 1 : 0, previousBand, currentBand, lqi, rssi, zigbeeLabel);
@@ -885,6 +912,9 @@ static void runEpaperRefresh(uint16_t co2ppm, float tempC, float rh, bool force,
   lastEpaperBand = currentBand;
   hasEpaperMeasurement = true;
   g_lastEpaperRefreshOk = true;
+  epaper_policy::recordSuccess(g_rtcEpaper, co2ppm, tempC, rh, currentBand);
+  g_epaperPolicyBaseMs = lastEpaper;
+  g_epaperRecoveryNeeded = false;
 
   Serial.printf("[EPD] cycle done, total=%lu ms\n", (unsigned long)(millis() - refreshStart));
   Serial.flush();
@@ -918,6 +948,19 @@ static void epaperTask(void *parameter) {
   }
 }
 
+static void refreshEpaperIfNeeded(uint16_t co2ppm, float tempC, float rh, const char *zigbeeLabel) {
+  const uint8_t zone = airQualityBand(co2ppm);
+  const uint32_t awakeMs = millis() - g_epaperPolicyBaseMs;
+  if (!epaper_policy::shouldRefresh(g_rtcEpaper, zone, awakeMs)) {
+    Serial.printf("[EPD] skip: RTC frame retained, cycles=%u/6, zone=%u, displayed=%u, current=%u ppm\n",
+                  g_rtcEpaper.cyclesSinceEpd, zone, g_rtcEpaper.lastDisplayedCo2, co2ppm);
+    return;
+  }
+  runEpaperRefresh(co2ppm, tempC, rh, !g_rtcEpaper.hasFrame, !hasEpaperMeasurement,
+                   epaper_policy::periodicDue(g_rtcEpaper, awakeMs), lastEpaperBand, zone,
+                   g_zigbeeLqi, g_zigbeeRssi, zigbeeLabel);
+}
+
 static void updateEpaper(uint16_t co2ppm, float tempC, float rh, bool force = false) {
   const uint32_t now = millis();
   const uint32_t age = lastEpaper ? now - lastEpaper : 0;
@@ -932,7 +975,8 @@ static void updateEpaper(uint16_t co2ppm, float tempC, float rh, bool force = fa
                             || fabsf(tempC - lastEpaperTempC) >= EPAPER_TEMP_DELTA_C
                             || fabsf(rh - lastEpaperRh) >= EPAPER_RH_DELTA;
 
-  const bool shouldRefresh = force || firstDraw || periodicReady || ((bandChanged || valueChanged) && changeReady);
+  const bool shouldRefresh = force || epaper_policy::shouldRefresh(
+      g_rtcEpaper, currentBand, now - g_epaperPolicyBaseMs);
 
   if (!shouldRefresh) {
     if (!lastEpaperSkipLog || now - lastEpaperSkipLog >= EPAPER_SKIP_LOG_MS) {
@@ -1513,7 +1557,7 @@ static void waitAwakeUntilZigbeeRecovered() {
   Serial.flush();
 
   uint32_t lastLog = 0;
-  uint32_t lastOfflineRefresh = lastEpaper;
+  uint32_t lastOfflineRefresh = millis();
   while (!zigbeeUsable()) {
     const uint32_t now = millis();
     handleButton();
@@ -1524,7 +1568,7 @@ static void waitAwakeUntilZigbeeRecovered() {
     const uint32_t refreshIntervalMs = epaperRefreshIntervalMs();
     if (!lastOfflineRefresh || now - lastOfflineRefresh >= refreshIntervalMs) {
       lastOfflineRefresh = millis();
-      Serial.println("[EPD] offline Zigbee wait: refreshing screen with new SCD4x single-shot.");
+      Serial.println("[EPD] offline Zigbee wait: measuring and checking RTC refresh policy.");
       Serial.flush();
       if (!refreshOfflineMeasurementAndEpaper()) {
         Serial.println("[EPD] offline Zigbee wait: refresh failed, will retry later.");
@@ -1566,9 +1610,8 @@ static bool refreshOfflineMeasurementAndEpaper() {
   Serial.printf("[SCD4x] offline single-shot: CO2=%u ppm, T=%.2f C, RH=%.2f %%\n", co2ppm, tempC, rh);
   Serial.flush();
 
-  runEpaperRefresh(g_lastCO2, g_lastTempC, g_lastRh, true, !hasEpaperMeasurement, true,
-                   lastEpaperBand, airQualityBand(g_lastCO2), g_zigbeeLqi, g_zigbeeRssi, zbLabel);
-  if (!g_lastEpaperRefreshOk) {
+  refreshEpaperIfNeeded(g_lastCO2, g_lastTempC, g_lastRh, zbLabel);
+  if (g_rtcEpaper.retryNeeded) {
     markEpaperRecoveryNeeded();
     return false;
   }
@@ -1592,9 +1635,8 @@ static void waitAwakeUntilDeepSleepReportAck() {
 }
 
 static void markEpaperRecoveryNeeded() {
-  if (!g_epaperRecoveryNeeded) {
-    g_lastEpaperRecoveryAttempt = millis();
-  }
+  g_rtcEpaper.retryNeeded = true;
+  g_lastEpaperRecoveryAttempt = millis();
   g_epaperRecoveryNeeded = true;
   Serial.printf("[EPD] display refresh failed; next recovery attempt in %lu ms.\n",
                 (unsigned long)epaperRefreshIntervalMs());
@@ -1602,7 +1644,7 @@ static void markEpaperRecoveryNeeded() {
 }
 
 static void serviceEpaperRecovery(uint32_t now) {
-  if ((!g_epaperRecoveryNeeded && g_lastEpaperRefreshOk) || !g_hasMeasurement) return;
+  if (!g_epaperRecoveryNeeded || !g_hasMeasurement) return;
   if (epaperBusyOrPending()) return;
 
   uint32_t retryIntervalMs = epaperRefreshIntervalMs();
@@ -1657,9 +1699,8 @@ static void waitAwakeUntilMeasurementAndEpaperOk() {
 
     char zbLabel[12];
     formatZigbeeLabel(zbLabel, sizeof(zbLabel));
-    runEpaperRefresh(g_lastCO2, g_lastTempC, g_lastRh, true, !hasEpaperMeasurement, true,
-                     lastEpaperBand, airQualityBand(g_lastCO2), g_zigbeeLqi, g_zigbeeRssi, zbLabel);
-    if (!g_lastEpaperRefreshOk) {
+    refreshEpaperIfNeeded(g_lastCO2, g_lastTempC, g_lastRh, zbLabel);
+    if (g_rtcEpaper.retryNeeded) {
       markEpaperRecoveryNeeded();
     }
   }
@@ -1673,9 +1714,8 @@ static void runDeepSleepCycle() {
   if (measurementOk && !g_lastEpaperRefreshOk && !g_epaperRecoveryNeeded) {
     char zbLabel[12];
     formatZigbeeLabel(zbLabel, sizeof(zbLabel));
-    runEpaperRefresh(g_lastCO2, g_lastTempC, g_lastRh, true, !hasEpaperMeasurement, true,
-                     lastEpaperBand, airQualityBand(g_lastCO2), g_zigbeeLqi, g_zigbeeRssi, zbLabel);
-    if (!g_lastEpaperRefreshOk) {
+    refreshEpaperIfNeeded(g_lastCO2, g_lastTempC, g_lastRh, zbLabel);
+    if (g_rtcEpaper.retryNeeded) {
       markEpaperRecoveryNeeded();
     }
   }
@@ -1821,6 +1861,7 @@ void setup() {
 
   Serial.println();
   Serial.println("Boot: ESP32-H2 SCD4x Zigbee + GDEY0154F51");
+  restoreEpaperState();
   loadDisplayRefreshInterval();
   display_refresh_interval_minutes = 10;
   loadLedState(g_ledEnabled, g_ledZigbeeLevel);
@@ -1844,8 +1885,7 @@ void setup() {
                 display_refresh_interval_minutes,
                 (unsigned long)epaperRefreshIntervalMs(),
                 (unsigned long)ZIGBEE_LQI_POLL_MS);
-  Serial.printf("EPD deltas: CO2=%u ppm, T=%.1f C, RH=%.1f %%\n",
-                EPAPER_CO2_DELTA_PPM, EPAPER_TEMP_DELTA_C, EPAPER_RH_DELTA);
+  Serial.println("EPD policy: cold boot, zone change, or 6 timer sleep cycles; RTC retains the displayed frame.");
   Serial.println("Serial check: if you see this on COM5, USB CDC logging is active.");
   Serial.flush();
 
@@ -1865,7 +1905,6 @@ void setup() {
   Serial.flush();
   handleButton();
 
-  EPD_ioInit();
   if (xTaskCreate(epaperTask, "epaper", 6144, nullptr, 1, &g_epaperTaskHandle) == pdPASS) {
     Serial.println("[EPD] background task started.");
   } else {
@@ -1886,9 +1925,8 @@ void setup() {
       g_lastRh = rh;
       g_hasMeasurement = true;
       Serial.printf("SCD4x single-shot: CO2=%u ppm, T=%.2f C, RH=%.2f %%\n", co2ppm, tempC, rh);
-      runEpaperRefresh(g_lastCO2, g_lastTempC, g_lastRh, true, !hasEpaperMeasurement, true,
-                       lastEpaperBand, airQualityBand(g_lastCO2), g_zigbeeLqi, g_zigbeeRssi, "NO ZB");
-      if (!g_lastEpaperRefreshOk) {
+      refreshEpaperIfNeeded(g_lastCO2, g_lastTempC, g_lastRh, "NO ZB");
+      if (g_rtcEpaper.retryNeeded) {
         markEpaperRecoveryNeeded();
       }
     } else {
