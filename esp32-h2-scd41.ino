@@ -330,6 +330,9 @@ static uint32_t g_epaperPolicyBaseMs = 0;
 
 static void restoreEpaperState() {
   const bool deepWake = esp_reset_reason() == ESP_RST_DEEPSLEEP;
+  if (!deepWake) {
+    g_rtcEpaperFrameSeq = 0;
+  }
   const bool timerWake = esp_sleep_get_wakeup_cause() == ESP_SLEEP_WAKEUP_TIMER;
   if (!isfinite(g_rtcEpaper.lastDisplayedTemp) || !isfinite(g_rtcEpaper.lastDisplayedRh)) {
     g_rtcEpaper.magic = 0;
@@ -746,53 +749,29 @@ static void formatZigbeeLabel(char *out, size_t len) {
 
 static void renderEpaperFrame(uint16_t co2ppm, float tempC, float rh, const char *zigbeeLabel, int16_t lqi, int8_t rssi, uint32_t frameSeq) {
   char buf[24];
-  const uint8_t statusColor = epdStatusColor(co2ppm);
-  const uint16_t statusText = (statusColor == EPD_COLOR_RED) ? EPD_COLOR_WHITE : EPD_COLOR_BLACK;
   const uint8_t ppmTextColor = epdPpmTextColor(co2ppm);
-  const uint8_t linkTextColor = epdLinkTextColor(lqi, zigbeeLabel);
 
   epdCanvas.clear(EPD_COLOR_WHITE);
-  epdCanvas.fillRect(0, 0, EPD_WIDTH, 34, EPD_COLOR_WHITE);
   epdCanvas.drawRect(0, 0, EPD_WIDTH, EPD_HEIGHT, EPD_COLOR_BLACK);
-  epdCanvas.drawFastHLine(0, 34, EPD_WIDTH, EPD_COLOR_BLACK);
-
   epdCanvas.setTextWrap(false);
 
-  snprintf(buf, sizeof(buf), "%umin", display_refresh_interval_minutes);
-  printTextAt(8, 20, 1, buf, EPD_COLOR_BLACK, false);
-
-  drawZigbeeStats(lqi, rssi, linkTextColor);
-
   snprintf(buf, sizeof(buf), "%u", co2ppm);
-  printTextAt(10, 46, (co2ppm > 9999) ? 3 : 4, buf, ppmTextColor);
-
-  printTextAt(110, 66, 2, "ppm", ppmTextColor);
-
-  epdCanvas.drawFastHLine(8, 90, EPD_WIDTH - 16, EPD_COLOR_BLACK);
+  const uint8_t co2Size = (co2ppm > 9999) ? 4 : 6;
+  const int16_t co2Width = strlen(buf) * 6 * co2Size;
+  printTextAt((EPD_WIDTH - co2Width) / 2, 6, co2Size, buf, ppmTextColor);
+  printRightAligned(EPD_WIDTH - 8, 56, 2, "ppm", ppmTextColor);
+  epdCanvas.drawFastHLine(8, 75, EPD_WIDTH - 16, EPD_COLOR_BLACK);
 
   snprintf(buf, sizeof(buf), "%.1f C", tempC);
-  drawTemperatureIcon(8, 94);
-  printTextAt(34, 99, 2, buf, EPD_COLOR_BLACK);
+  drawTemperatureIcon(5, 83);
+  printRightAligned(EPD_WIDTH - 6, 82, strlen(buf) <= 6 ? 3 : 2, buf, EPD_COLOR_BLACK);
 
   snprintf(buf, sizeof(buf), "%.0f %%", rh);
-  drawHumidityIcon(8, 116);
-  printTextAt(34, 118, 2, buf, EPD_COLOR_BLACK);
+  drawHumidityIcon(5, 113);
+  printRightAligned(EPD_WIDTH - 6, 112, 3, buf, EPD_COLOR_BLACK);
 
-  epdCanvas.fillRect(0, 136, EPD_WIDTH, 16, statusColor);
-  epdCanvas.drawFastHLine(0, 136, EPD_WIDTH, EPD_COLOR_BLACK);
-  const char *statusLabel = "AIR GOOD";
-  if (co2ppm < green_ppm) {
-    statusLabel = "AIR GOOD";
-  } else if (co2ppm < yellow_ppm) {
-    statusLabel = "AIR OK";
-  } else if (co2ppm < orange_ppm) {
-    statusLabel = "VENTILATE";
-  } else if (co2ppm < red_ppm) {
-    statusLabel = "HIGH CO2";
-  } else {
-    statusLabel = "ALARM";
-  }
-  printTextAt(8, 141, 1, statusLabel, statusText);
+  snprintf(buf, sizeof(buf), "%lu", (unsigned long)frameSeq);
+  printRightAligned(EPD_WIDTH - 6, 141, 1, buf, EPD_COLOR_BLACK, false);
 }
 
 static bool epaperBusyOrPending() {
@@ -874,9 +853,7 @@ static void runEpaperRefresh(uint16_t co2ppm, float tempC, float rh, bool force,
   Serial.flush();
 
   const uint32_t renderStart = millis();
-  g_rtcEpaperFrameSeq = (g_rtcEpaperFrameSeq + 1) % 1000;
-  g_epaperFrameSeq = g_rtcEpaperFrameSeq;
-  const uint32_t frameSeq = g_epaperFrameSeq;
+  const uint32_t frameSeq = g_rtcEpaper.hasFrame ? (g_rtcEpaperFrameSeq + 1) % 1000 : 0;
   renderEpaperFrame(co2ppm, tempC, rh, zigbeeLabel, lqi, rssi, frameSeq);
   Serial.printf("[EPD] render frame done, frame=%lu, elapsed=%lu ms\n",
                 (unsigned long)frameSeq,
@@ -905,6 +882,8 @@ static void runEpaperRefresh(uint16_t co2ppm, float tempC, float rh, bool force,
 
   EPD_sleep();
 
+  g_rtcEpaperFrameSeq = frameSeq;
+  g_epaperFrameSeq = frameSeq;
   lastEpaper = millis();
   lastEpaperCO2 = co2ppm;
   lastEpaperTempC = tempC;
